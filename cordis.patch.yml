@@ -1,0 +1,11 @@
+- id: session-query-sqlite
+  config:
+    path: !!js dshHomePath('expmem/recall-index.sqlite')
+    openAt: first-search
+
+- insert:
+    - id: tool-session-query
+      name: '@deepseek-ai/dsh-tool-session-query'
+
+    - id: expmem
+      name: '@creative-dswork/dsh-expmem'
