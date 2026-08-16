@@ -46,7 +46,8 @@
   ],
   "publishConfig": {
     "access": "public",
-    "registry": "https://registry.npmjs.org/"
+    "registry": "https://registry.npmjs.org/",
+    "provenance": true
   },
   "dsh": {
     "bundle": {
@@ -58,7 +59,9 @@
     "typecheck": "tsc --noEmit",
     "build": "pnpm run clean && tsc --emitDeclarationOnly && tsdown",
     "test": "node --test",
+    "test:pack": "pnpm run build && node tests/packed-install.mjs",
     "check": "pnpm run typecheck && pnpm run build && pnpm run test",
+    "release:check": "pnpm run check && pnpm run test:pack",
     "pack:dry-run": "npm pack --dry-run",
     "prepack": "pnpm run check"
   },
