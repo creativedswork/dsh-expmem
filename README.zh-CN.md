@@ -11,10 +11,12 @@ DSH ExpMem 是社区插件，并非 DeepSeek 官方项目。它为 DSH Agent 提
 ```mermaid
 flowchart LR
   Agent["DSH Agent"]
+  Sources["Claude Code / Codex<br/>Markdown 记忆"]
 
   Agent -->|"expmem_search / write / forget"| Archive["ExpMem Archive<br/>JSON 文件"]
   Agent -->|"session_search / event_search"| Query["DSH Session Query<br/>SQLite 全文索引"]
   Query --> Recall["DSH Recall<br/>会话 JSONL"]
+  Sources -->|"dsh-expmem import"| Archive
 
   Archive --> Habits["用户习惯"]
   Archive --> Experience["任务经验"]
@@ -43,6 +45,29 @@ dsh plugin --profile web add @creative-dswork/dsh-expmem
 dsh web
 ```
 
+## 导入 Claude Code 与 Codex 记忆
+
+先预览，再一次导入两种 Agent 生成的 Markdown 记忆：
+
+```sh
+pnpm dlx @creative-dswork/dsh-expmem import all --dry-run
+pnpm dlx @creative-dswork/dsh-expmem import all
+```
+
+Claude Code 默认扫描 `~/.claude/projects/**/memory/*.md`；Codex 默认扫描
+`$CODEX_HOME/memories/**/*.md`，未设置 `CODEX_HOME` 时使用
+`~/.codex/memories/**/*.md`。自定义目录可显式指定：
+
+```sh
+pnpm dlx @creative-dswork/dsh-expmem import claude --claude-dir /path/to/memory
+pnpm dlx @creative-dswork/dsh-expmem import codex --codex-dir /path/to/memories
+```
+
+每个源文件会成为一条 `experience` 记录，并保存来源 Agent、源文件绝对路径和 SHA-256。
+重复执行时，未变化的文件会跳过，内容变化的文件会原位更新；源文件不会被修改或删除。
+可通过 `--workspace /path/to/project` 显式设置项目范围；使用 Claude 默认目录结构时，
+ExpMem 会在映射唯一的情况下自动恢复源 workspace。
+
 ## 存储
 
 默认文件布局：
@@ -58,7 +83,7 @@ $DSH_HOME/
         └── insight/<uuid>.json
 ```
 
-Archive 记录包含分类、标题、正文、标签、时间戳，以及可选的来源 workspace 和 session。写入采用临时文件加原子重命名。
+Archive 记录包含分类、标题、正文、标签、时间戳、可选的来源 workspace/session，以及导入来源。写入采用临时文件加原子重命名。
 
 ## 工具
 
@@ -114,7 +139,7 @@ dsh --profile web --dump-config
 ## 当前范围
 
 - Archive 搜索采用透明的线性扫描；只有实际数据规模证明需要时才增加索引。
-- 暂不包含向量检索、后台 LLM 总结器、自动记忆晋升、模型去重或保留周期调度。
+- 暂不包含向量检索、后台 LLM 总结器、自动记忆晋升、语义去重模型或保留周期调度。
 - Recall 的删除与保留策略继续由 DSH 会话持久化负责。
 
 ## 许可证

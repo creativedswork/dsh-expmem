@@ -13,7 +13,6 @@ import type { JsonValue, ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import {
   FileExperienceArchive,
-  type ExperienceKind,
   type ExperienceSearchOptions,
   type ExperienceSource,
   type ExperienceWriteInput,
@@ -28,6 +27,7 @@ export type {
   ExperienceSearchPage,
   ExperienceSource,
   ExperienceWriteInput,
+  ImportedMemorySource,
 } from './storage.js'
 export { FileExperienceArchive } from './storage.js'
 

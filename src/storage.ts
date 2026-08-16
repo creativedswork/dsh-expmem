@@ -7,10 +7,17 @@ import {
   rm,
   writeFile,
 } from 'node:fs/promises'
-import { basename, dirname, join, relative } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative } from 'node:path'
 
 /** Stable categories for reusable personal development experience. */
 export type ExperienceKind = 'habit' | 'experience' | 'insight'
+
+/** Provenance for a record imported from another coding agent. */
+export interface ImportedMemorySource {
+  provider: 'claude' | 'codex'
+  path: string
+  sha256: string
+}
 
 /** One actively maintained experience-memory record stored as JSON. */
 export interface ExperienceMemory {
@@ -24,6 +31,7 @@ export interface ExperienceMemory {
   updatedAt: number
   workspace?: string
   sourceSession?: string
+  importedFrom?: ImportedMemorySource
 }
 
 /** One Archive search result. */
@@ -36,6 +44,7 @@ export interface ExperienceSearchHit {
   timestamp: number
   path: string
   workspace?: string
+  importedFrom?: ImportedMemorySource
 }
 
 /** Cursor-based Archive search page. */
@@ -51,6 +60,7 @@ export interface ExperienceWriteInput {
   content: string
   tags?: string[]
   id?: string
+  importedFrom?: ImportedMemorySource
 }
 
 /** Session provenance attached to an Archive write. */
@@ -103,6 +113,9 @@ export class FileExperienceArchive {
 
     const path = this.memoryPath(input.kind, id)
     const previous = input.id === undefined ? undefined : await this.read(path)
+    const importedFrom = input.importedFrom === undefined
+      ? previous?.importedFrom
+      : normalizeImportedSource(input.importedFrom)
     const now = Date.now()
     const memory: ExperienceMemory = {
       version: 1,
@@ -115,6 +128,7 @@ export class FileExperienceArchive {
       updatedAt: now,
       ...source.workspace === undefined ? {} : { workspace: source.workspace },
       ...source.sessionId === undefined ? {} : { sourceSession: source.sessionId },
+      ...importedFrom === undefined ? {} : { importedFrom },
     }
     await atomicJsonWrite(path, memory)
     return memory
@@ -124,6 +138,19 @@ export class FileExperienceArchive {
   async forget(kind: ExperienceKind, id: string): Promise<void> {
     if (!MEMORY_ID.test(id)) throw new Error('ExpMem id must be a UUID')
     await rm(this.memoryPath(kind, id))
+  }
+
+  /** Read all valid Archive records. */
+  async list(): Promise<ExperienceMemory[]> {
+    const memories: ExperienceMemory[] = []
+    for (const kind of EXPERIENCE_KINDS) {
+      const directory = join(this.rootDir, 'archive', kind)
+      for (const name of await jsonFiles(directory)) {
+        const memory = await this.read(join(directory, name))
+        if (memory !== undefined) memories.push(memory)
+      }
+    }
+    return memories
   }
 
   /** Search the Archive using case-insensitive AND terms. */
@@ -138,32 +165,31 @@ export class FileExperienceArchive {
     const hits: ExperienceSearchHit[] = []
 
     // ponytail: linear scans keep files transparent; add an index only when measured corpus size requires it.
-    for (const kind of options.kinds ?? EXPERIENCE_KINDS) {
-      const directory = join(this.rootDir, 'archive', kind)
-      for (const name of await jsonFiles(directory)) {
-        const path = join(directory, name)
-        const memory = await this.read(path)
-        if (memory === undefined) continue
-        if (options.workspace !== undefined && memory.workspace !== options.workspace) continue
-        const searchable = [
-          memory.kind,
-          memory.title,
-          memory.content,
-          memory.tags.join(' '),
-          memory.workspace ?? '',
-        ].join('\n').toLocaleLowerCase()
-        if (!terms.every(term => searchable.includes(term))) continue
-        hits.push({
-          id: memory.id,
-          kind: memory.kind,
-          title: memory.title,
-          text: preview(memory.content, this.limits.maxPreviewChars),
-          tags: memory.tags,
-          timestamp: memory.updatedAt,
-          path: relative(this.rootDir, path),
-          ...memory.workspace === undefined ? {} : { workspace: memory.workspace },
-        })
-      }
+    for (const memory of await this.list()) {
+      if (options.kinds !== undefined && !options.kinds.includes(memory.kind)) continue
+      if (options.workspace !== undefined && memory.workspace !== options.workspace) continue
+      const searchable = [
+        memory.kind,
+        memory.title,
+        memory.content,
+        memory.tags.join(' '),
+        memory.workspace ?? '',
+        memory.importedFrom?.provider ?? '',
+        memory.importedFrom?.path ?? '',
+      ].join('\n').toLocaleLowerCase()
+      if (!terms.every(term => searchable.includes(term))) continue
+      const path = this.memoryPath(memory.kind, memory.id)
+      hits.push({
+        id: memory.id,
+        kind: memory.kind,
+        title: memory.title,
+        text: preview(memory.content, this.limits.maxPreviewChars),
+        tags: memory.tags,
+        timestamp: memory.updatedAt,
+        path: relative(this.rootDir, path),
+        ...memory.workspace === undefined ? {} : { workspace: memory.workspace },
+        ...memory.importedFrom === undefined ? {} : { importedFrom: memory.importedFrom },
+      })
     }
     hits.sort((left, right) => right.timestamp - left.timestamp || left.id.localeCompare(right.id))
     const page = hits.slice(offset, offset + options.limit)
@@ -263,10 +289,29 @@ function isExperienceMemory(value: unknown): value is ExperienceMemory {
     && Number.isSafeInteger(value.updatedAt)
     && (value.workspace === undefined || typeof value.workspace === 'string')
     && (value.sourceSession === undefined || typeof value.sourceSession === 'string')
+    && (value.importedFrom === undefined || isImportedMemorySource(value.importedFrom))
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function normalizeImportedSource(value: ImportedMemorySource): ImportedMemorySource {
+  if (!isImportedMemorySource(value)) throw new Error('invalid ExpMem import source')
+  return {
+    provider: value.provider,
+    path: value.path,
+    sha256: value.sha256.toLocaleLowerCase(),
+  }
+}
+
+function isImportedMemorySource(value: unknown): value is ImportedMemorySource {
+  return isRecord(value)
+    && (value.provider === 'claude' || value.provider === 'codex')
+    && typeof value.path === 'string'
+    && isAbsolute(value.path)
+    && typeof value.sha256 === 'string'
+    && /^[0-9a-f]{64}$/i.test(value.sha256)
 }
 
 function isNodeError(error: unknown, code: string): boolean {

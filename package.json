@@ -23,6 +23,9 @@
   "engines": {
     "node": "^22.19.0 || >=24.0.0"
   },
+  "bin": {
+    "dsh-expmem": "./lib/cli.js"
+  },
   "main": "./lib/index.js",
   "types": "./lib/types/index.d.ts",
   "exports": {
@@ -34,7 +37,7 @@
     "./package.json": "./package.json"
   },
   "files": [
-    "lib/index.js",
+    "lib/*.js",
     "lib/types/**/*.d.ts",
     "cordis.patch.yml",
     "README.md",

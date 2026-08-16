@@ -11,10 +11,12 @@ DSH ExpMem is a community plugin, not an official DeepSeek project. It gives a D
 ```mermaid
 flowchart LR
   Agent["DSH Agent"]
+  Sources["Claude Code / Codex<br/>Markdown memory"]
 
   Agent -->|"expmem_search / write / forget"| Archive["ExpMem Archive<br/>JSON files"]
   Agent -->|"session_search / event_search"| Query["DSH Session Query<br/>SQLite FTS index"]
   Query --> Recall["DSH Recall<br/>session JSONL"]
+  Sources -->|"dsh-expmem import"| Archive
 
   Archive --> Habits["Habits"]
   Archive --> Experience["Task experience"]
@@ -43,6 +45,30 @@ Start DSH normally:
 dsh web
 ```
 
+## Import Claude Code and Codex Memory
+
+Preview and then import both agents' generated Markdown memories:
+
+```sh
+pnpm dlx @creative-dswork/dsh-expmem import all --dry-run
+pnpm dlx @creative-dswork/dsh-expmem import all
+```
+
+The defaults are `~/.claude/projects/**/memory/*.md` for Claude Code and
+`$CODEX_HOME/memories/**/*.md` (or `~/.codex/memories/**/*.md`) for Codex.
+Override custom locations when needed:
+
+```sh
+pnpm dlx @creative-dswork/dsh-expmem import claude --claude-dir /path/to/memory
+pnpm dlx @creative-dswork/dsh-expmem import codex --codex-dir /path/to/memories
+```
+
+Each source file becomes one `experience` record with its provider, absolute source path, and
+SHA-256 provenance. Repeating the command skips unchanged files and updates changed files in
+place. Source files are never modified or deleted. Use `--workspace /path/to/project` to attach
+an explicit project scope; the default Claude layout is mapped to its project when that mapping
+is unambiguous.
+
 ## Storage
 
 The default files are:
@@ -58,7 +84,8 @@ $DSH_HOME/
         └── insight/<uuid>.json
 ```
 
-Archive records contain their category, title, content, tags, timestamps, and optional source workspace/session. Writes use a temporary file plus atomic rename.
+Archive records contain their category, title, content, tags, timestamps, optional source
+workspace/session, and import provenance. Writes use a temporary file plus atomic rename.
 
 ## Tools
 
@@ -114,7 +141,7 @@ dsh --profile web --dump-config
 ## Current Scope
 
 - Archive search is a transparent linear scan; add an index only after corpus size demonstrates the need.
-- No embeddings, background LLM summarizer, automatic memory promotion, deduplication model, or retention scheduler is included.
+- No embeddings, background LLM summarizer, automatic memory promotion, semantic deduplication model, or retention scheduler is included.
 - Recall deletion and retention remain owned by DSH session persistence.
 
 ## License
