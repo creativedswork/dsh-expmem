@@ -15,6 +15,7 @@ flowchart LR
 
   Agent -->|"expmem_search / write / forget"| Archive["ExpMem Archive<br/>JSON 文件"]
   Agent -->|"session_search / event_search"| Query["DSH Session Query<br/>SQLite 全文索引"]
+  Meter["DSH Token Meter"] -->|"70% 压力提示"| Agent
   Query --> Recall["DSH Recall<br/>会话 JSONL"]
   Sources -->|"dsh-expmem import"| Archive
 
@@ -25,6 +26,7 @@ flowchart LR
 
 - **Recall** 是过往会话的原始记录。DSH 已通过 JSONL 持久化，并由 `dsh-session-query` 提供检索。
 - **Archive** 是 Agent 主动提炼的稳定知识。ExpMem 为每条记录保存一个可直接检查的 JSON 文件。
+- **压力晋升** 会在 DSH 压缩上下文前，要求当前 Agent 保存高价值经验。
 - ExpMem 不复制会话事件，也不修改 Agent Loop。
 
 ## 安装
@@ -37,7 +39,8 @@ dsh plugin --profile web add @creative-dswork/dsh-expmem
 
 1. 在首次搜索时启用 DSH 已有的 session-query SQLite 后端；
 2. 加载 DSH 的 `session_search`、`session_event_search`、追踪和读取工具；
-3. 加载 `expmem_search`、`expmem_write` 和 `expmem_forget`。
+3. 加载 `expmem_search`、`expmem_write` 和 `expmem_forget`；
+4. 每个 DSH 压缩周期启用一次 ExpMem 晋升提示。
 
 按正常方式启动 DSH：
 
@@ -97,6 +100,16 @@ Archive 记录包含分类、标题、正文、标签、时间戳、可选的来
 
 ExpMem 会要求 Agent 只保存稳定且经过验证的知识，不保存密钥、临时进度、原始日志或未经验证的推断。
 
+## 压力晋升
+
+每个模型 step 开始前，ExpMem 复用 DSH Token Meter 测量当前上下文。默认达到 70% 时，
+它会注入一条 synthetic user notice，要求 Agent 先搜索已有 ExpMem 记录，最多保存三条
+稳定的用户习惯、任务经验或工程洞见，然后继续原任务。
+
+该提示会进入 DSH Session 日志，因此每个成功压缩周期只触发一次。如果 DSH 在提示送达前
+已经完成压缩，ExpMem 会改为提供被压缩事件的范围，要求 Agent 从 Recall 读取原始消息后
+补做晋升。整个过程不需要后台 Worker 或独立的 LLM 总结器。
+
 ## 配置
 
 在 profile 的 `cordis.patch.yml` 中覆盖 `expmem`：
@@ -108,9 +121,14 @@ ExpMem 会要求 Agent 只保存稳定且经过验证的知识，不保存密钥
     maxEntryChars: 20000
     maxPreviewChars: 1000
     maxSearchResults: 20
+    promotionEnabled: true
+    warningRatio: 0.7
+    maxPromotionsPerCycle: 3
+    recoveryAfterCompaction: true
 ```
 
 `rootDir` 必须是绝对路径。搜索采用不区分大小写的字面 AND 匹配，空白分隔的关键词必须全部出现；空查询会列出最新记录。
+压力晋升只会在当前 DSH 组合同时提供 Token Meter 和模型上下文窗口元数据时启用。
 
 如需修改 Recall 索引位置，可覆盖 bundle 中已有的配置行：
 
@@ -139,7 +157,8 @@ dsh --profile web --dump-config
 ## 当前范围
 
 - Archive 搜索采用透明的线性扫描；只有实际数据规模证明需要时才增加索引。
-- 暂不包含向量检索、后台 LLM 总结器、自动记忆晋升、语义去重模型或保留周期调度。
+- 晋升采用 Agent 协作模式：由当前 Agent 判断哪些记录符合条件，也可以不写入任何记录。
+- 暂不包含向量检索、后台 LLM 总结器、语义去重模型或保留周期调度。
 - Recall 的删除与保留策略继续由 DSH 会话持久化负责。
 
 ## 许可证

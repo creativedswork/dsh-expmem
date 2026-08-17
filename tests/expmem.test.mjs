@@ -101,3 +101,114 @@ test('provides file-backed experience memory over native DSH Recall', async () =
     await rm(rootDir, { recursive: true, force: true })
   }
 })
+
+test('promotes once per compaction cycle and recovers threshold jumps from Recall', async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), 'dsh-expmem-pressure-'))
+  const ctx = new Context()
+  let totalTokens = 699
+  ctx.provide('tools', { register: () => () => undefined })
+  ctx.provide('systemPrompt', { section: () => () => undefined })
+  ctx.provide('llm', {
+    resolveModelInfo: async () => ({ context: { contextWindow: 1000 } }),
+  })
+  ctx.provide('tokenMeter', {
+    measure: () => ({ totalTokens }),
+  })
+
+  try {
+    await ctx.plugin(plugin, { rootDir })
+    const session = fakeSession('pressure-session')
+    const agent = {
+      id: session.id,
+      options: { provider: 'mock', model: 'mock' },
+      session,
+    }
+    const dispatch = (terminal = () => Promise.resolve({ kind: 'enter', messages: [] })) =>
+      ctx.waterfall('agent/pre-step', {
+        agent,
+        messages: [],
+        turn: 1,
+        step: 1,
+        signal: new AbortController().signal,
+      }, terminal)
+
+    assert.equal((await dispatch()).messages.length, 0)
+    totalTokens = 700
+    const warning = (await dispatch()).messages[0]
+    assert.equal(warning.source.summary, 'ExpMem memory pressure')
+    assert.match(warning.content[0].text, /70%/)
+    appendEvent(session, 'user/message', warning)
+
+    totalTokens = 750
+    assert.equal((await dispatch()).messages.length, 0)
+
+    appendCompaction(session, 'after-warning', 1, 20)
+    totalTokens = 100
+    assert.equal((await dispatch()).messages.length, 0)
+
+    appendCompaction(session, 'without-warning', 21, 40)
+    const recovery = (await dispatch()).messages[0]
+    assert.equal(recovery.source.summary, 'ExpMem post-compaction recovery')
+    assert.match(recovery.content[0].text, /events 21 through 40/)
+    assert.match(recovery.content[0].text, /session_event_read/)
+    appendEvent(session, 'user/message', recovery)
+    assert.equal((await dispatch()).messages.length, 0)
+
+    const jumped = fakeSession('jumped-session')
+    const jumpedAgent = {
+      id: jumped.id,
+      options: { provider: 'mock', model: 'mock' },
+      session: jumped,
+    }
+    totalTokens = 850
+    const jumpedDecision = await ctx.waterfall('agent/pre-step', {
+      agent: jumpedAgent,
+      messages: [],
+      turn: 1,
+      step: 1,
+      signal: new AbortController().signal,
+    }, () => {
+      appendCompaction(jumped, 'threshold-jump', 5, 55)
+      return Promise.resolve({ kind: 'enter', messages: [] })
+    })
+    assert.equal(jumpedDecision.messages[0].source.summary, 'ExpMem post-compaction recovery')
+    assert.match(jumpedDecision.messages[0].content[0].text, /events 5 through 55/)
+  } finally {
+    await ctx.fiber.dispose()
+    await rm(rootDir, { recursive: true, force: true })
+  }
+})
+
+function fakeSession(id) {
+  return {
+    id,
+    header: { cwd: '/workspace/project' },
+    events: [],
+    requestHeader: () => ({ config: { provider: 'mock', model: 'mock' } }),
+  }
+}
+
+function appendEvent(session, type, data) {
+  session.events.push({
+    seq: session.events.length,
+    time: session.events.length,
+    type,
+    data,
+  })
+}
+
+function appendCompaction(session, compactionId, start, end) {
+  appendEvent(session, 'compaction/start', { compactionId, turn: 1 })
+  appendEvent(session, 'compaction/summary', {
+    compactionId,
+    summary: [],
+    shadowedRange: { start, end },
+    shadowedSeqs: [start, end],
+    shadowedTokenCount: 100,
+    provider: 'mock',
+    model: 'mock',
+    rawOutput: [],
+    llmStreamCall: true,
+  })
+  appendEvent(session, 'compaction/end', { compactionId, turn: 1 })
+}

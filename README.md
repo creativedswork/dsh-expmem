@@ -15,6 +15,7 @@ flowchart LR
 
   Agent -->|"expmem_search / write / forget"| Archive["ExpMem Archive<br/>JSON files"]
   Agent -->|"session_search / event_search"| Query["DSH Session Query<br/>SQLite FTS index"]
+  Meter["DSH Token Meter"] -->|"70% pressure notice"| Agent
   Query --> Recall["DSH Recall<br/>session JSONL"]
   Sources -->|"dsh-expmem import"| Archive
 
@@ -25,6 +26,7 @@ flowchart LR
 
 - **Recall** is verbatim prior-session history. DSH already stores it in JSONL and provides search through `dsh-session-query`.
 - **Archive** is stable knowledge deliberately distilled by the agent. ExpMem stores one readable JSON file per record.
+- **Pressure promotion** asks the current agent to preserve high-value experience before DSH compacts the context.
 - ExpMem does not duplicate session events or modify the Agent Loop.
 
 ## Install
@@ -37,7 +39,8 @@ The bundle:
 
 1. enables the existing DSH session-query SQLite backend on first search;
 2. adds DSH's `session_search`, `session_event_search`, trace, and read tools;
-3. adds `expmem_search`, `expmem_write`, and `expmem_forget`.
+3. adds `expmem_search`, `expmem_write`, and `expmem_forget`;
+4. enables one ExpMem promotion notice per DSH compaction cycle.
 
 Start DSH normally:
 
@@ -99,6 +102,18 @@ workspace/session, and import provenance. Writes use a temporary file plus atomi
 
 ExpMem instructs the agent to store only stable, verified knowledge and to avoid secrets, transient progress, raw logs, and unverified assumptions.
 
+## Pressure Promotion
+
+Before each model step, ExpMem reuses DSH's token meter to measure the current context. At the
+default 70% threshold, it adds one synthetic user notice asking the agent to search existing
+ExpMem records and preserve at most three durable habits, experiences, or insights before
+continuing the original task.
+
+The notice is stored in the DSH session log, so ExpMem emits it only once per successful
+compaction cycle. If DSH compacts before the notice can be delivered, ExpMem instead cites the
+compacted event range and asks the agent to recover the original messages from Recall. No
+background worker or separate LLM summarizer is involved.
+
 ## Configuration
 
 Override the `expmem` row in the profile's `cordis.patch.yml`:
@@ -110,9 +125,15 @@ Override the `expmem` row in the profile's `cordis.patch.yml`:
     maxEntryChars: 20000
     maxPreviewChars: 1000
     maxSearchResults: 20
+    promotionEnabled: true
+    warningRatio: 0.7
+    maxPromotionsPerCycle: 3
+    recoveryAfterCompaction: true
 ```
 
 `rootDir` must be absolute. Search is a case-insensitive literal AND over whitespace-separated terms. An empty query lists the newest records.
+Pressure promotion activates only when the active DSH composition provides both the token meter
+and model context-window metadata.
 
 To change Recall indexing, override the bundle's existing row:
 
@@ -141,7 +162,8 @@ dsh --profile web --dump-config
 ## Current Scope
 
 - Archive search is a transparent linear scan; add an index only after corpus size demonstrates the need.
-- No embeddings, background LLM summarizer, automatic memory promotion, semantic deduplication model, or retention scheduler is included.
+- Promotion is cooperative: the current agent decides which records qualify and may decline to write any.
+- No embeddings, background LLM summarizer, semantic deduplication model, or retention scheduler is included.
 - Recall deletion and retention remain owned by DSH session persistence.
 
 ## License

@@ -8,6 +8,11 @@ import { homedir } from 'node:os'
 import { isAbsolute, join, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
+import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
+import type {} from '@deepseek-ai/dsh-compaction'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { Session } from '@deepseek-ai/dsh-session'
+import type {} from '@deepseek-ai/dsh-token-meter'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { JsonValue, ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-system-prompt'
@@ -52,6 +57,12 @@ export const DEFAULT_MAX_PREVIEW_CHARS = 1_000
 /** Default maximum hits returned by one search call. */
 export const DEFAULT_MAX_SEARCH_RESULTS = 20
 
+/** Default context pressure that asks the agent to promote durable experience. */
+export const DEFAULT_WARNING_RATIO = 0.7
+
+/** Default bound the pressure notice places on one promotion pass. */
+export const DEFAULT_MAX_PROMOTIONS_PER_CYCLE = 3
+
 /** Plugin configuration. */
 export interface Config {
   /** Absolute storage directory. Defaults to `$DSH_HOME/expmem` or `~/.dsh/expmem`. */
@@ -62,6 +73,14 @@ export interface Config {
   maxPreviewChars?: number
   /** Maximum hits returned by one search call. Defaults to 20. */
   maxSearchResults?: number
+  /** Ask the agent to promote durable experience before DSH compaction. Defaults to true. */
+  promotionEnabled?: boolean
+  /** Context-window ratio that triggers one promotion notice per compaction cycle. Defaults to 0.7. */
+  warningRatio?: number
+  /** Maximum records requested by one promotion notice. Defaults to 3. */
+  maxPromotionsPerCycle?: number
+  /** Recover from threshold jumps by reading compacted events from Recall. Defaults to true. */
+  recoveryAfterCompaction?: boolean
 }
 
 /** Runtime schema for Loader validation and defaults. */
@@ -70,6 +89,10 @@ export const Config: z<Config> = z.object({
   maxEntryChars: z.number().step(1).min(1).default(DEFAULT_MAX_ENTRY_CHARS),
   maxPreviewChars: z.number().step(1).min(1).default(DEFAULT_MAX_PREVIEW_CHARS),
   maxSearchResults: z.number().step(1).min(1).default(DEFAULT_MAX_SEARCH_RESULTS),
+  promotionEnabled: z.boolean().default(true),
+  warningRatio: z.number().min(0).max(1).default(DEFAULT_WARNING_RATIO),
+  maxPromotionsPerCycle: z.number().step(1).min(1).default(DEFAULT_MAX_PROMOTIONS_PER_CYCLE),
+  recoveryAfterCompaction: z.boolean().default(true),
 })
 
 interface ResolvedConfig {
@@ -77,13 +100,21 @@ interface ResolvedConfig {
   maxEntryChars: number
   maxPreviewChars: number
   maxSearchResults: number
+  promotionEnabled: boolean
+  warningRatio: number
+  maxPromotionsPerCycle: number
+  recoveryAfterCompaction: boolean
 }
 
 const EXPMEM_PROMPT =
   'Use session_search or session_event_search for verbatim Recall from prior DSH sessions. '
   + 'Use expmem_search for distilled user habits, task experience, and reusable insights. '
   + 'Use expmem_write only for stable, verified knowledge; update an existing hit instead of duplicating it. '
+  + 'When ExpMem reports memory pressure, preserve the requested high-value records before continuing the task. '
   + 'Never archive secrets, transient progress, raw logs, or unverified assumptions.'
+
+const PRESSURE_NOTICE = 'ExpMem memory pressure'
+const RECOVERY_NOTICE = 'ExpMem post-compaction recovery'
 
 const JSON_OUTPUT = {
   schema: { type: 'json' as const },
@@ -107,6 +138,182 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   ctx.tools.register(searchTool(archive, resolved))
   ctx.tools.register(writeTool(archive))
   ctx.tools.register(forgetTool(archive))
+
+  if (resolved.promotionEnabled) {
+    ctx.inject(['llm', 'tokenMeter'], runtime => registerPressurePromotion(runtime, resolved))
+  }
+}
+
+interface PendingRecovery {
+  compactionId: string
+  start?: number
+  end?: number
+}
+
+interface PromotionState {
+  consumedEvents: number
+  warnedSinceCompaction: boolean
+  pendingRecovery?: PendingRecovery
+  summaries: Map<string, PendingRecovery>
+}
+
+function registerPressurePromotion(ctx: Context, config: ResolvedConfig): void {
+  const states = new WeakMap<Session, PromotionState>()
+
+  ctx.on('agent/pre-step', async (
+    { agent, signal },
+    next,
+  ): Promise<PreStepDecision> => {
+    const before = syncPromotionState(states, agent.session)
+    const recoveryPending = config.recoveryAfterCompaction
+      && before.pendingRecovery !== undefined
+    const ratio = before.warnedSinceCompaction || recoveryPending
+      ? undefined
+      : await contextPressure(ctx, agent, signal)
+    const pressureWarning = ratio !== undefined && ratio >= config.warningRatio
+    const decision = await next()
+    if (decision.kind === 'reject' || signal.aborted) return decision
+
+    const after = syncPromotionState(states, agent.session)
+    if (
+      config.recoveryAfterCompaction
+      && !after.warnedSinceCompaction
+      && after.pendingRecovery !== undefined
+    ) {
+      return appendPromotionNotice(
+        decision,
+        recoveryMessage(agent, after.pendingRecovery, config.maxPromotionsPerCycle),
+      )
+    }
+    if (!pressureWarning || after.warnedSinceCompaction) return decision
+    return appendPromotionNotice(
+      decision,
+      pressureMessage(ratio, config.maxPromotionsPerCycle),
+    )
+  }, { prepend: true })
+}
+
+function appendPromotionNotice(
+  decision: Extract<PreStepDecision, { kind: 'enter' }>,
+  message: ReturnType<typeof createUserMessage>,
+): PreStepDecision {
+  return { kind: 'enter', messages: [...decision.messages, message] }
+}
+
+function pressureMessage(ratio: number, maxPromotions: number) {
+  const text = [
+    `ExpMem memory pressure: ${Math.round(ratio * 100)}% of the model context is in use.`,
+    'Before continuing the original task, preserve durable knowledge from the current context:',
+    '1. Use expmem_search before writing and update an existing record instead of duplicating it.',
+    `2. Preserve at most ${maxPromotions} high-value records.`,
+    '3. Use habit for stable user preferences, experience for reusable condition/action/outcome, and insight for generalizable engineering judgment.',
+    '4. Do not preserve secrets, raw logs, transient progress, or unverified assumptions.',
+    'Continue the original task after preservation.',
+  ].join('\n')
+  return createUserMessage({
+    content: [{ type: 'text', text }],
+    source: {
+      kind: 'plugin',
+      plugin: name,
+      form: 'notice',
+      summary: PRESSURE_NOTICE,
+    },
+  })
+}
+
+function recoveryMessage(agent: Agent, recovery: PendingRecovery, maxPromotions: number) {
+  const range = recovery.start === undefined || recovery.end === undefined
+    ? 'the compacted source events'
+    : `session events ${recovery.start} through ${recovery.end}`
+  const text = [
+    `ExpMem recovery: DSH compaction ${recovery.compactionId} completed before experience promotion.`,
+    `The original messages remain in Recall. Use session_event_read or session_event_search for session ${String(agent.id)} to review ${range}.`,
+    `Preserve at most ${maxPromotions} durable habits, reusable experiences, or generalizable insights with expmem_write.`,
+    'Search ExpMem first, update existing records, and then continue the original task.',
+  ].join('\n')
+  return createUserMessage({
+    content: [{ type: 'text', text }],
+    source: {
+      kind: 'plugin',
+      plugin: name,
+      form: 'notice',
+      summary: RECOVERY_NOTICE,
+    },
+  })
+}
+
+async function contextPressure(
+  ctx: Context,
+  agent: Agent,
+  signal: AbortSignal,
+): Promise<number | undefined> {
+  const routed = agent.session.requestHeader()?.config
+  const provider = routed?.provider || agent.options.provider
+  const model = routed?.model || agent.options.model
+  if (provider === undefined || model === undefined) return undefined
+
+  try {
+    const info = await ctx.llm.resolveModelInfo(provider, model, signal)
+    const contextWindow = info.context?.contextWindow
+    if (contextWindow === undefined) return undefined
+    return ctx.tokenMeter.measure(agent.session).totalTokens / contextWindow
+  } catch {
+    signal.throwIfAborted()
+    return undefined
+  }
+}
+
+function syncPromotionState(
+  states: WeakMap<Session, PromotionState>,
+  session: Session,
+): PromotionState {
+  let state = states.get(session)
+  if (state === undefined || state.consumedEvents > session.events.length) {
+    state = {
+      consumedEvents: 0,
+      warnedSinceCompaction: false,
+      summaries: new Map(),
+    }
+    states.set(session, state)
+  }
+
+  for (let index = state.consumedEvents; index < session.events.length; index += 1) {
+    const event = session.events[index]
+    if (event === undefined) continue
+    if (isPromotionNotice(event)) {
+      state.warnedSinceCompaction = true
+      state.pendingRecovery = undefined
+      continue
+    }
+    if (event.type === 'compaction/summary') {
+      state.summaries.set(String(event.data.compactionId), {
+        compactionId: String(event.data.compactionId),
+        start: event.data.shadowedRange.start,
+        end: event.data.shadowedRange.end,
+      })
+      continue
+    }
+    if (event.type !== 'compaction/end') continue
+    const compactionId = String(event.data.compactionId)
+    if (event.data.error === undefined) {
+      state.pendingRecovery = state.warnedSinceCompaction
+        ? undefined
+        : state.summaries.get(compactionId) ?? { compactionId }
+      state.warnedSinceCompaction = false
+    }
+    state.summaries.delete(compactionId)
+  }
+  state.consumedEvents = session.events.length
+  return state
+}
+
+function isPromotionNotice(event: Session['events'][number]): boolean {
+  if (event.type !== 'user/message') return false
+  const source = event.data.source
+  return source.kind === 'plugin'
+    && source.plugin === name
+    && source.form === 'notice'
+    && (source.summary === PRESSURE_NOTICE || source.summary === RECOVERY_NOTICE)
 }
 
 function searchTool(archive: FileExperienceArchive, config: ResolvedConfig): ToolDefinition {
@@ -236,7 +443,23 @@ function resolveConfig(config: Config): ResolvedConfig {
       DEFAULT_MAX_SEARCH_RESULTS,
       'maxSearchResults',
     ),
+    promotionEnabled: config.promotionEnabled ?? true,
+    warningRatio: warningRatio(config.warningRatio),
+    maxPromotionsPerCycle: positiveInteger(
+      config.maxPromotionsPerCycle,
+      DEFAULT_MAX_PROMOTIONS_PER_CYCLE,
+      'maxPromotionsPerCycle',
+    ),
+    recoveryAfterCompaction: config.recoveryAfterCompaction ?? true,
   }
+}
+
+function warningRatio(value: number | undefined): number {
+  const resolved = value ?? DEFAULT_WARNING_RATIO
+  if (!Number.isFinite(resolved) || resolved <= 0 || resolved >= 1) {
+    throw new TypeError('expmem: warningRatio must be greater than 0 and less than 1')
+  }
+  return resolved
 }
 
 function positiveInteger(value: number | undefined, fallback: number, name: string): number {
