@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "id": "11111111-1111-4111-8111-111111111111",
+  "kind": "habit",
+  "title": "Legacy fixture",
+  "content": "Keep valid legacy records visible.",
+  "tags": [
+    "fixture"
+  ],
+  "createdAt": 100,
+  "updatedAt": 200,
+  "sourceSession": "fixture-session"
+}

@@ -12,6 +12,13 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
+import { FileExperienceArchive } from '../lib/index.js'
+
+const LIMITS = {
+  maxEntryChars: 1_000_000,
+  maxPreviewChars: 1,
+  maxSearchResults: 1,
+}
 
 test('imports Claude and Codex Markdown memories idempotently', async () => {
   const temporary = await mkdtemp(join(tmpdir(), 'dsh-expmem-import-'))
@@ -81,10 +88,13 @@ test('imports Claude and Codex Markdown memories idempotently', async () => {
 
     const initial = await records(rootDir)
     assert.equal(initial.length, 3)
-    assert.deepEqual(new Set(initial.map(record => record.importedFrom.provider)), new Set([
+    assert.deepEqual(new Set(initial.map(record => importedEvidence(record).provider)), new Set([
       'claude',
       'codex',
     ]))
+    assert.ok(initial.every(record => record.schemaVersion === 1))
+    assert.ok(initial.every(record => record.status === 'candidate'))
+    assert.ok(initial.every(record => importedEvidence(record).sha256.startsWith('sha256:')))
     assert.ok(initial.every(record => record.workspace === '/workspace/project'))
 
     const second = runCli([
@@ -101,7 +111,7 @@ test('imports Claude and Codex Markdown memories idempotently', async () => {
     assert.equal(second[0].skipped, 2)
     assert.equal(second[1].skipped, 1)
 
-    const topicBefore = initial.find(record => record.importedFrom.path === topicPath)
+    const topicBefore = initial.find(record => importedEvidence(record).path === topicPath)
     await writeFile(topicPath, '# Debugging insight\n\nRestart only the fixture server.\n')
     const changed = runCli([
       'import',
@@ -116,10 +126,57 @@ test('imports Claude and Codex Markdown memories idempotently', async () => {
     assert.equal(changed[0].skipped, 1)
 
     const afterUpdate = await records(rootDir)
-    const topicAfter = afterUpdate.find(record => record.importedFrom.path === topicPath)
+    const topicAfter = afterUpdate.find(record => importedEvidence(record).path === topicPath)
     assert.equal(afterUpdate.length, 3)
     assert.equal(topicAfter.id, topicBefore.id)
     assert.match(topicAfter.content, /Restart only/)
+
+    const codexPath = join(codexDir, 'memory_summary.md')
+    const codexBefore = afterUpdate.find(record => importedEvidence(record).path === codexPath)
+    const archive = new FileExperienceArchive(rootDir, LIMITS)
+    const withSource = await archive.writeCandidate({
+      id: codexBefore.id,
+      kind: codexBefore.kind,
+      title: codexBefore.title,
+      content: codexBefore.content,
+      tags: codexBefore.tags,
+      evidence: [
+        ...codexBefore.evidence,
+        { kind: 'external-uri', uri: 'https://example.test/codex-memory' },
+      ],
+    }, { workspace: codexBefore.workspace })
+    const external = withSource.evidence.find(item => item.kind === 'external-uri')
+    await archive.transition({
+      kind: withSource.kind,
+      id: withSource.id,
+      status: 'verified',
+      verification: {
+        actor: { kind: 'agent', id: 'reviewer' },
+        method: 'source-check',
+        evidenceIds: [external.id],
+      },
+    })
+    await writeFile(codexPath, '# Codex memory\n\nPrefer focused, verified diffs.\n')
+    const protectedChange = runCli([
+      'import',
+      'codex',
+      '--root-dir',
+      rootDir,
+      '--codex-dir',
+      codexDir,
+      '--json',
+    ])
+    assert.equal(protectedChange[0].created, 1)
+    const afterProtectedChange = await records(rootDir)
+    assert.equal(afterProtectedChange.length, 4)
+    assert.equal(
+      afterProtectedChange.find(record => record.id === withSource.id).status,
+      'verified',
+    )
+    assert.ok(afterProtectedChange.some(record =>
+      record.id !== withSource.id
+      && importedEvidence(record).path === codexPath
+      && record.status === 'candidate'))
 
     await writeFile(join(codexDir, 'new.md'), '# New memory\n\nDo not write this yet.\n')
     const dryRun = runCli([
@@ -133,7 +190,7 @@ test('imports Claude and Codex Markdown memories idempotently', async () => {
       '--json',
     ])
     assert.equal(dryRun[0].created, 1)
-    assert.equal((await records(rootDir)).length, 3)
+    assert.equal((await records(rootDir)).length, 4)
   } finally {
     await rm(temporary, { recursive: true, force: true })
   }
@@ -155,4 +212,10 @@ async function records(rootDir) {
   return await Promise.all(names.map(async name => JSON.parse(
     await readFile(join(directory, name), 'utf8'),
   )))
+}
+
+function importedEvidence(record) {
+  const evidence = record.evidence.find(item => item.kind === 'imported-file')
+  assert.ok(evidence, `missing imported-file evidence for ${record.id}`)
+  return evidence
 }

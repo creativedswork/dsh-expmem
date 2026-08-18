@@ -1,0 +1,27 @@
+{
+  "schemaVersion": "review-report@1",
+  "reportId": "rr-fixture-001",
+  "targetType": "memory-claim",
+  "targetId": "77777777-7777-4777-8777-777777777777",
+  "reviewedAt": 1784680000000,
+  "reviewers": [
+    {
+      "provider": "example",
+      "model": "review-model",
+      "verdict": "mixed",
+      "summary": "Sanitized fixture.",
+      "cannotClaim": [
+        "factual verification"
+      ]
+    }
+  ],
+  "evidenceHashes": [
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  ],
+  "verdictCounts": {
+    "support": 0,
+    "mixed": 1,
+    "against": 0,
+    "invalid": 0
+  }
+}

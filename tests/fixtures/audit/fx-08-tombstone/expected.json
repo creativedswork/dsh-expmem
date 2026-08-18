@@ -1,0 +1,10 @@
+{
+  "keys": [
+    "deletedAt",
+    "id",
+    "kind",
+    "reasonCode",
+    "schemaVersion"
+  ],
+  "reasonCode": "privacy"
+}

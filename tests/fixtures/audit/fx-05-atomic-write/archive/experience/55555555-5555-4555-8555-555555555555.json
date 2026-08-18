@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "55555555-5555-4555-8555-555555555555",
+  "kind": "experience",
+  "title": "Committed fixture",
+  "content": "The committed record remains visible.",
+  "tags": [
+    "fixture"
+  ],
+  "status": "candidate",
+  "authoredBy": {
+    "kind": "agent",
+    "id": "fixture"
+  },
+  "evidence": [],
+  "createdAt": 500,
+  "updatedAt": 600
+}

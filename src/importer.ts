@@ -4,7 +4,9 @@ import { homedir } from 'node:os'
 import { basename, extname, join, relative, resolve, sep } from 'node:path'
 import {
   FileExperienceArchive,
-  type ImportedMemorySource,
+  type ArchiveWarning,
+  type ExperienceMemory,
+  type MemoryEvidence,
 } from './storage.js'
 
 export type ImportProvider = 'claude' | 'codex'
@@ -35,7 +37,15 @@ export interface MemoryImportResult {
   skipped: number
   ignored: number
   dryRun: boolean
+  warnings: ArchiveWarning[]
   items: MemoryImportItem[]
+}
+
+type ImportedFileEvidence = Extract<MemoryEvidence, { kind: 'imported-file' }>
+
+interface ImportedRecord {
+  memory: ExperienceMemory
+  evidence: ImportedFileEvidence
 }
 
 const MAX_IMPORT_CHARS = 1_000_000
@@ -53,11 +63,8 @@ export async function importMemories(options: MemoryImportOptions): Promise<Memo
   if (!options.dryRun) await archive.initialize()
 
   const files = await markdownFiles(sourceDir)
-  const existing = new Map(
-    (await archive.list())
-      .filter(memory => memory.importedFrom !== undefined)
-      .map(memory => [importKey(memory.importedFrom!), memory]),
-  )
+  const scan = await archive.scan()
+  const existing = importedRecords(scan.memories)
   const workspaceByProject = options.provider === 'claude' && options.workspace === undefined
     ? await claudeWorkspaceMap()
     : new Map<string, string>()
@@ -73,41 +80,62 @@ export async function importMemories(options: MemoryImportOptions): Promise<Memo
       throw new Error(`memory file exceeds ${MAX_IMPORT_CHARS} characters: ${path}`)
     }
 
-    const importedFrom: ImportedMemorySource = {
-      provider: options.provider,
-      path,
-      sha256: createHash('sha256').update(content).digest('hex'),
-    }
-    const previous = existing.get(importKey(importedFrom))
+    const sha256 = `sha256:${createHash('sha256').update(content).digest('hex')}`
+    const key = importKey(options.provider, path)
+    const previous = existing.get(key)
     const title = markdownTitle(content, path)
-    if (previous?.importedFrom?.sha256 === importedFrom.sha256) {
-      items.push({ path, title, status: 'skipped', id: previous.id })
+    if (previous?.evidence.sha256 === sha256) {
+      items.push({ path, title, status: 'skipped', id: previous.memory.id })
       continue
     }
 
-    const status = previous === undefined ? 'created' : 'updated'
+    const updatesCandidate = previous?.memory.status === 'candidate'
+    const status: ImportStatus = updatesCandidate ? 'updated' : 'created'
     if (options.dryRun) {
       items.push({
         path,
         title,
         status,
-        ...previous === undefined ? {} : { id: previous.id },
+        ...(updatesCandidate ? { id: previous.memory.id } : {}),
       })
       continue
     }
 
     const workspace = options.workspace
-      ?? previous?.workspace
+      ?? previous?.memory.workspace
       ?? claudeWorkspace(path, sourceDir, workspaceByProject)
-    const memory = await archive.write({
-      ...previous === undefined ? {} : { id: previous.id },
-      kind: previous?.kind ?? 'experience',
+    const evidence = [
+      ...(updatesCandidate
+        ? previous.memory.evidence.filter(item =>
+            item.kind !== 'review-report'
+            && !(item.kind === 'imported-file'
+              && item.provider === options.provider
+              && item.path === path))
+        : []),
+      {
+        kind: 'imported-file' as const,
+        provider: options.provider,
+        path,
+        sha256,
+        observedAt: Date.now(),
+      },
+    ]
+    const memory = await archive.writeCandidate({
+      ...(updatesCandidate ? { id: previous.memory.id } : {}),
+      kind: previous?.memory.kind ?? 'experience',
       title,
       content,
       tags: importTags(options.provider, path),
-      importedFrom,
+      authoredBy: { kind: 'agent', id: options.provider },
+      evidence,
     }, workspace === undefined ? {} : { workspace })
-    existing.set(importKey(importedFrom), memory)
+    const imported = memory.evidence.find(
+      (item): item is ImportedFileEvidence =>
+        item.kind === 'imported-file'
+        && item.provider === options.provider
+        && item.path === path,
+    )!
+    existing.set(key, { memory, evidence: imported })
     items.push({ path, title, status, id: memory.id })
   }
 
@@ -121,6 +149,7 @@ export async function importMemories(options: MemoryImportOptions): Promise<Memo
     skipped: count(items, 'skipped'),
     ignored: count(items, 'ignored'),
     dryRun: options.dryRun ?? false,
+    warnings: scan.warnings,
     items,
   }
 }
@@ -132,6 +161,21 @@ export function defaultMemoryDir(provider: ImportProvider): string {
     return join(claudeHome, 'projects')
   }
   return join(process.env.CODEX_HOME ?? join(homedir(), '.codex'), 'memories')
+}
+
+function importedRecords(memories: ExperienceMemory[]): Map<string, ImportedRecord> {
+  const records = new Map<string, ImportedRecord>()
+  for (const memory of memories) {
+    for (const evidence of memory.evidence) {
+      if (evidence.kind !== 'imported-file') continue
+      const key = importKey(evidence.provider, evidence.path)
+      const previous = records.get(key)
+      if (previous === undefined || previous.evidence.observedAt < evidence.observedAt) {
+        records.set(key, { memory, evidence })
+      }
+    }
+  }
+  return records
 }
 
 async function markdownFiles(directory: string): Promise<string[]> {
@@ -151,8 +195,8 @@ async function markdownFiles(directory: string): Promise<string[]> {
   return files.sort()
 }
 
-function importKey(source: ImportedMemorySource): string {
-  return `${source.provider}\0${source.path}`
+function importKey(provider: ImportProvider, path: string): string {
+  return `${provider}\0${path}`
 }
 
 function markdownTitle(content: string, path: string): string {

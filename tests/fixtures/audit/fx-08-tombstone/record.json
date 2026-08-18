@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "99999999-9999-4999-8999-999999999999",
+  "kind": "habit",
+  "title": "Private fixture memory",
+  "content": "This content must not enter the tombstone.",
+  "tags": [
+    "fixture"
+  ],
+  "status": "candidate",
+  "authoredBy": {
+    "kind": "agent",
+    "id": "fixture"
+  },
+  "evidence": [],
+  "createdAt": 900,
+  "updatedAt": 1000,
+  "workspace": "/sanitized/workspace"
+}

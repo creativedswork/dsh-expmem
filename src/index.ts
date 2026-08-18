@@ -20,21 +20,37 @@ import {
   FileExperienceArchive,
   type ExperienceSearchOptions,
   type ExperienceSource,
+  type ExperienceTransitionInput,
   type ExperienceWriteInput,
+  type MemoryActor,
+  type MemoryEvidenceInput,
+  type MemoryVerificationInput,
 } from './storage.js'
 
 export type {
   ArchiveLimits,
+  ArchiveScanResult,
+  ArchiveWarning,
+  DeletionReasonCode,
   ExperienceKind,
   ExperienceMemory,
   ExperienceSearchHit,
   ExperienceSearchOptions,
   ExperienceSearchPage,
   ExperienceSource,
+  ExperienceTransitionInput,
   ExperienceWriteInput,
   ImportedMemorySource,
+  MemoryActor,
+  MemoryEvidence,
+  MemoryEvidenceInput,
+  MemoryStatus,
+  MemoryTombstone,
+  MemoryVerification,
+  MemoryVerificationInput,
 } from './storage.js'
 export { FileExperienceArchive } from './storage.js'
+export { claimSha256, MemorySchemaError } from './schema.js'
 
 /** Cordis plugin name used by Loader diagnostics. */
 export const name = 'expmem'
@@ -109,9 +125,11 @@ interface ResolvedConfig {
 const EXPMEM_PROMPT =
   'Use session_search or session_event_search for verbatim Recall from prior DSH sessions. '
   + 'Use expmem_search for distilled user habits, task experience, and reusable insights. '
-  + 'Use expmem_write only for stable, verified knowledge; update an existing hit instead of duplicating it. '
+  + 'Use expmem_write for stable candidate knowledge; update an existing candidate instead of duplicating it. '
+  + 'Treat candidate and disputed memory as unverified, and use expmem_transition only with cited evidence. '
+  + 'A review report is useful provenance but cannot verify a claim by itself. '
   + 'When ExpMem reports memory pressure, preserve the requested high-value records before continuing the task. '
-  + 'Never archive secrets, transient progress, raw logs, or unverified assumptions.'
+  + 'Never archive secrets, transient progress, or raw logs.'
 
 const PRESSURE_NOTICE = 'ExpMem memory pressure'
 const RECOVERY_NOTICE = 'ExpMem post-compaction recovery'
@@ -137,6 +155,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   })
   ctx.tools.register(searchTool(archive, resolved))
   ctx.tools.register(writeTool(archive))
+  ctx.tools.register(transitionTool(archive))
   ctx.tools.register(forgetTool(archive))
 
   if (resolved.promotionEnabled) {
@@ -205,9 +224,10 @@ function pressureMessage(ratio: number, maxPromotions: number) {
     `ExpMem memory pressure: ${Math.round(ratio * 100)}% of the model context is in use.`,
     'Before continuing the original task, preserve durable knowledge from the current context:',
     '1. Use expmem_search before writing and update an existing record instead of duplicating it.',
-    `2. Preserve at most ${maxPromotions} high-value records.`,
+    `2. Preserve at most ${maxPromotions} high-value records as candidates.`,
     '3. Use habit for stable user preferences, experience for reusable condition/action/outcome, and insight for generalizable engineering judgment.',
-    '4. Do not preserve secrets, raw logs, transient progress, or unverified assumptions.',
+    '4. Include inspectable evidence when available; do not promote a candidate without qualifying evidence.',
+    '5. Do not preserve secrets, raw logs, or transient progress.',
     'Continue the original task after preservation.',
   ].join('\n')
   return createUserMessage({
@@ -228,7 +248,7 @@ function recoveryMessage(agent: Agent, recovery: PendingRecovery, maxPromotions:
   const text = [
     `ExpMem recovery: DSH compaction ${recovery.compactionId} completed before experience promotion.`,
     `The original messages remain in Recall. Use session_event_read or session_event_search for session ${String(agent.id)} to review ${range}.`,
-    `Preserve at most ${maxPromotions} durable habits, reusable experiences, or generalizable insights with expmem_write.`,
+    `Preserve at most ${maxPromotions} durable habits, reusable experiences, or generalizable insights as candidates with expmem_write.`,
     'Search ExpMem first, update existing records, and then continue the original task.',
   ].join('\n')
   return createUserMessage({
@@ -316,6 +336,95 @@ function isPromotionNotice(event: Session['events'][number]): boolean {
     && (source.summary === PRESSURE_NOTICE || source.summary === RECOVERY_NOTICE)
 }
 
+const ACTOR_PARAMETER = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    kind: {
+      type: 'string',
+      enum: ['user', 'agent', 'tool'],
+      required: true,
+    },
+    id: { type: 'string' },
+  },
+} as const
+
+const EVIDENCE_PARAMETER = {
+  type: 'array',
+  items: {
+    oneOf: [
+      {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          kind: { type: 'string', const: 'session-event', required: true },
+          id: { type: 'string' },
+          sessionId: { type: 'string', required: true },
+          startSeq: { type: 'integer' },
+          endSeq: { type: 'integer' },
+          observedAt: { type: 'integer' },
+        },
+      },
+      {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          kind: { type: 'string', const: 'imported-file', required: true },
+          id: { type: 'string' },
+          provider: { type: 'string', enum: ['claude', 'codex'], required: true },
+          path: { type: 'string', required: true },
+          sha256: { type: 'string', required: true },
+          observedAt: { type: 'integer' },
+        },
+      },
+      {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          kind: { type: 'string', const: 'external-uri', required: true },
+          id: { type: 'string' },
+          uri: { type: 'string', required: true },
+          capturedTextSha256: { type: 'string' },
+          observedAt: { type: 'integer' },
+        },
+      },
+      {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          kind: { type: 'string', const: 'review-report', required: true },
+          id: { type: 'string' },
+          schemaVersion: { type: 'string', const: 'review-report@1', required: true },
+          reportId: { type: 'string', required: true },
+          location: { type: 'string', required: true },
+          sha256: { type: 'string', required: true },
+          targetSha256: { type: 'string', required: true },
+          observedAt: { type: 'integer' },
+        },
+      },
+    ],
+  },
+} as const
+
+const VERIFICATION_PARAMETER = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    actor: { ...ACTOR_PARAMETER, required: true },
+    method: {
+      type: 'string',
+      enum: ['user-confirmation', 'tool-reproduction', 'source-check'],
+      required: true,
+    },
+    evidenceIds: {
+      type: 'array',
+      items: { type: 'string' },
+      required: true,
+    },
+    verifiedAt: { type: 'integer' },
+  },
+} as const
+
 function searchTool(archive: FileExperienceArchive, config: ResolvedConfig): ToolDefinition {
   return defineTool({
     name: 'expmem_search',
@@ -331,6 +440,14 @@ function searchTool(archive: FileExperienceArchive, config: ResolvedConfig): Too
         type: 'array',
         items: { type: 'string', enum: ['habit', 'experience', 'insight'] },
         description: 'Optional experience categories.',
+      },
+      statuses: {
+        type: 'array',
+        items: {
+          type: 'string',
+          enum: ['candidate', 'verified', 'disputed', 'superseded'],
+        },
+        description: 'Optional lifecycle states. Superseded records are hidden by default.',
       },
       workspace: {
         type: 'string',
@@ -354,6 +471,7 @@ function searchTool(archive: FileExperienceArchive, config: ResolvedConfig): Too
         ...args.workspace === undefined ? {} : { workspace: args.workspace },
         ...args.cursor === undefined ? {} : { cursor: args.cursor },
         ...args.kinds === undefined ? {} : { kinds: args.kinds },
+        ...args.statuses === undefined ? {} : { statuses: args.statuses },
       }
       return await archive.search(options) as unknown as JsonValue
     },
@@ -364,7 +482,7 @@ function writeTool(archive: FileExperienceArchive): ToolDefinition {
   return defineTool({
     name: 'expmem_write',
     description:
-      'Create a distilled experience-memory record, or update one by passing its existing id and category.',
+      'Create or update a candidate experience-memory record. This tool cannot mark memory verified.',
     parameters: {
       kind: {
         type: 'string',
@@ -389,7 +507,23 @@ function writeTool(archive: FileExperienceArchive): ToolDefinition {
       },
       id: {
         type: 'string',
-        description: 'Existing ExpMem UUID to update. Omit to create.',
+        description: 'Existing candidate UUID to update. Omit to create.',
+      },
+      authoredBy: {
+        ...ACTOR_PARAMETER,
+        description: 'Optional claim author. User authorship requires complete Session evidence.',
+      },
+      claimedAt: {
+        type: 'integer',
+        description: 'Optional time asserted by the claim, as Unix epoch milliseconds.',
+      },
+      evidence: {
+        ...EVIDENCE_PARAMETER,
+        description: 'Inspectable provenance. On update, this replaces prior evidence.',
+      },
+      evidenceText: {
+        type: 'string',
+        description: 'Optional human-readable evidence context; never verifies a claim.',
       },
     },
     output: JSON_OUTPUT,
@@ -400,16 +534,25 @@ function writeTool(archive: FileExperienceArchive): ToolDefinition {
         content: args.content,
         ...args.id === undefined ? {} : { id: args.id },
         ...args.tags === undefined ? {} : { tags: args.tags },
+        ...args.authoredBy === undefined
+          ? {}
+          : { authoredBy: args.authoredBy as MemoryActor },
+        ...args.claimedAt === undefined ? {} : { claimedAt: args.claimedAt },
+        ...args.evidence === undefined
+          ? {}
+          : { evidence: args.evidence as MemoryEvidenceInput[] },
+        ...args.evidenceText === undefined ? {} : { evidenceText: args.evidenceText },
       }
-      return await archive.write(write, sourceOf(exec)) as unknown as JsonValue
+      return await archive.writeCandidate(write, sourceOf(exec)) as unknown as JsonValue
     },
   })
 }
 
-function forgetTool(archive: FileExperienceArchive): ToolDefinition {
+function transitionTool(archive: FileExperienceArchive): ToolDefinition {
   return defineTool({
-    name: 'expmem_forget',
-    description: 'Delete one distilled ExpMem Archive record by exact category and id.',
+    name: 'expmem_transition',
+    description:
+      'Verify or dispute one ExpMem record with inspectable evidence. Review reports cannot verify a claim by themselves.',
     parameters: {
       kind: {
         type: 'string',
@@ -422,11 +565,87 @@ function forgetTool(archive: FileExperienceArchive): ToolDefinition {
         required: true,
         description: 'UUID from the search hit.',
       },
+      status: {
+        type: 'string',
+        enum: ['verified', 'disputed'],
+        required: true,
+        description: 'Target lifecycle status.',
+      },
+      evidence: {
+        ...EVIDENCE_PARAMETER,
+        description: 'Evidence to append before applying the transition.',
+      },
+      evidenceText: {
+        type: 'string',
+        description: 'Optional human-readable evidence context.',
+      },
+      verification: {
+        ...VERIFICATION_PARAMETER,
+        description: 'Required when first transitioning a candidate to verified.',
+      },
+      supersedes: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Existing record UUIDs replaced by this verified claim.',
+      },
+      conflictsWith: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Existing record UUIDs that conflict with this disputed claim.',
+      },
+    },
+    output: JSON_OUTPUT,
+    async execute(args, exec) {
+      const transition: ExperienceTransitionInput = {
+        kind: args.kind,
+        id: args.id,
+        status: args.status,
+        ...args.evidence === undefined
+          ? {}
+          : { evidence: args.evidence as MemoryEvidenceInput[] },
+        ...args.evidenceText === undefined ? {} : { evidenceText: args.evidenceText },
+        ...args.verification === undefined
+          ? {}
+          : { verification: args.verification as MemoryVerificationInput },
+        ...args.supersedes === undefined ? {} : { supersedes: args.supersedes },
+        ...args.conflictsWith === undefined ? {} : { conflictsWith: args.conflictsWith },
+      }
+      return await archive.transition(transition, sourceOf(exec)) as unknown as JsonValue
+    },
+  })
+}
+
+function forgetTool(archive: FileExperienceArchive): ToolDefinition {
+  return defineTool({
+    name: 'expmem_forget',
+    description:
+      'Delete one candidate ExpMem record. Protected states require explicit CLI confirmation.',
+    parameters: {
+      kind: {
+        type: 'string',
+        enum: ['habit', 'experience', 'insight'],
+        required: true,
+        description: 'Category from the search hit.',
+      },
+      id: {
+        type: 'string',
+        required: true,
+        description: 'UUID from the search hit.',
+      },
+      reasonCode: {
+        type: 'string',
+        enum: ['user-request', 'duplicate', 'incorrect', 'privacy'],
+        description: 'Minimal tombstone reason. Defaults to user-request.',
+      },
     },
     output: JSON_OUTPUT,
     async execute(args) {
-      await archive.forget(args.kind, args.id)
-      return { forgotten: true, kind: args.kind, id: args.id }
+      const tombstone = await archive.forgetCandidate(
+        args.kind,
+        args.id,
+        args.reasonCode ?? 'user-request',
+      )
+      return { forgotten: true, tombstone } as unknown as JsonValue
     },
   })
 }
@@ -472,8 +691,10 @@ function positiveInteger(value: number | undefined, fallback: number, name: stri
 
 function sourceOf(exec: ToolRunContext): ExperienceSource {
   const session = exec.agent?.session
+  const actorId = exec.agent?.id ?? session?.id
   return {
     ...session === undefined ? {} : { sessionId: String(session.id) },
     ...session?.header.cwd === undefined ? {} : { workspace: session.header.cwd },
+    ...actorId === undefined ? {} : { actor: { kind: 'agent', id: String(actorId) } },
   }
 }

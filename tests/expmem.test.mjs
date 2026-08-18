@@ -44,10 +44,12 @@ test('provides file-backed experience memory over native DSH Recall', async () =
     assert.deepEqual([...definitions.keys()].sort(), [
       'expmem_forget',
       'expmem_search',
+      'expmem_transition',
       'expmem_write',
     ])
     assert.match(sections[0].text, /session_search/)
     assert.match(sections[0].text, /expmem_search/)
+    assert.match(sections[0].text, /candidate/)
 
     const exec = {
       signal: new AbortController().signal,
@@ -63,8 +65,15 @@ test('provides file-backed experience memory over native DSH Recall', async () =
       title: 'Documentation preference',
       content: 'Keep English and Chinese README files aligned.',
       tags: ['docs', 'bilingual'],
+      evidence: [{
+        kind: 'external-uri',
+        uri: 'https://example.test/documentation-policy',
+      }],
     }, exec)
     assert.match(created.id, /^[0-9a-f-]{36}$/)
+    assert.equal(created.schemaVersion, 1)
+    assert.equal(created.status, 'candidate')
+    assert.deepEqual(created.authoredBy, { kind: 'agent', id: 'session-1' })
     assert.equal(created.workspace, '/workspace/project')
 
     const page = await definitions.get('expmem_search').execute({
@@ -79,6 +88,7 @@ test('provides file-backed experience memory over native DSH Recall', async () =
       title: 'Documentation preference',
       content: 'Keep English and Chinese README files aligned in npm packages.',
       tags: ['docs', 'bilingual', 'npm'],
+      evidence: created.evidence,
     }, exec)
     assert.equal(updated.id, created.id)
     assert.equal(updated.createdAt, created.createdAt)
@@ -89,13 +99,38 @@ test('provides file-backed experience memory over native DSH Recall', async () =
       'utf8',
     ))
     assert.equal(stored.content, updated.content)
+    assert.equal(stored.status, 'candidate')
 
-    await definitions.get('expmem_forget').execute({
+    const external = updated.evidence.find(item => item.kind === 'external-uri')
+    const verified = await definitions.get('expmem_transition').execute({
       kind: 'habit',
       id: created.id,
+      status: 'verified',
+      verification: {
+        actor: { kind: 'agent', id: 'reviewer' },
+        method: 'source-check',
+        evidenceIds: [external.id],
+      },
     }, exec)
+    assert.equal(verified.status, 'verified')
+    await assert.rejects(definitions.get('expmem_forget').execute({
+      kind: 'habit',
+      id: created.id,
+    }, exec), /requires confirmed CLI deletion/)
+
+    const disposable = await definitions.get('expmem_write').execute({
+      kind: 'experience',
+      title: 'Disposable candidate',
+      content: 'Delete this candidate.',
+    }, exec)
+    const forgotten = await definitions.get('expmem_forget').execute({
+      kind: 'experience',
+      id: disposable.id,
+      reasonCode: 'duplicate',
+    }, exec)
+    assert.equal(forgotten.tombstone.reasonCode, 'duplicate')
     const empty = await definitions.get('expmem_search').execute({ query: '' }, exec)
-    assert.deepEqual(empty.hits, [])
+    assert.deepEqual(empty.hits.map(hit => hit.id), [created.id])
   } finally {
     await ctx.fiber.dispose()
     await rm(rootDir, { recursive: true, force: true })

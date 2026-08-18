@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "77777777-7777-4777-8777-777777777777",
+  "kind": "insight",
+  "title": "Unverified fixture claim",
+  "content": "This claim has only review evidence.",
+  "tags": [
+    "fixture"
+  ],
+  "status": "candidate",
+  "authoredBy": {
+    "kind": "agent",
+    "id": "fixture"
+  },
+  "evidence": [
+    {
+      "id": "88888888-8888-4888-8888-888888888888",
+      "kind": "review-report",
+      "schemaVersion": "review-report@1",
+      "reportId": "rr-fixture-001",
+      "location": "../review-report-v1/report.json",
+      "sha256": "sha256:7b7a9746aea8b1a9d374028a2b2f76b60e82e2a108594a653bd8e2c78cd1f437",
+      "targetSha256": "sha256:c29020f3b0ca3908614c6c8e9ef97e29fa7222c3c401287f6f86fdf62e6c9c74",
+      "observedAt": 1784680000000
+    }
+  ],
+  "createdAt": 700,
+  "updatedAt": 800
+}

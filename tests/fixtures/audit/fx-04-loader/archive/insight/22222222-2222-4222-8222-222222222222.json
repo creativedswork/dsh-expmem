@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "22222222-2222-4222-8222-222222222222",
+  "kind": "insight",
+  "title": "Current fixture",
+  "content": "Report every rejected file.",
+  "tags": [
+    "fixture"
+  ],
+  "status": "candidate",
+  "authoredBy": {
+    "kind": "agent",
+    "id": "fixture"
+  },
+  "evidence": [],
+  "createdAt": 300,
+  "updatedAt": 400
+}
