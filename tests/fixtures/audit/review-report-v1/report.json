@@ -6,8 +6,31 @@
   "reviewedAt": 1784680000000,
   "reviewers": [
     {
-      "provider": "example",
-      "model": "review-model",
+      "provider": "glm",
+      "model": "glm-5",
+      "verdict": "mixed",
+      "summary": "Sanitized fixture.",
+      "cannotClaim": [
+        "factual verification"
+      ]
+    },
+    {
+      "provider": "claude",
+      "model": "claude-opus-5",
+      "verdict": "support",
+      "summary": "Sanitized fixture.",
+      "cannotClaim": []
+    },
+    {
+      "provider": "gemini",
+      "model": "gemini-3.1-pro",
+      "verdict": "mixed",
+      "summary": "Sanitized fixture.",
+      "cannotClaim": []
+    },
+    {
+      "provider": "codex",
+      "model": "codex",
       "verdict": "mixed",
       "summary": "Sanitized fixture.",
       "cannotClaim": [
@@ -19,8 +42,8 @@
     "sha256:1111111111111111111111111111111111111111111111111111111111111111"
   ],
   "verdictCounts": {
-    "support": 0,
-    "mixed": 1,
+    "support": 1,
+    "mixed": 3,
     "against": 0,
     "invalid": 0
   }

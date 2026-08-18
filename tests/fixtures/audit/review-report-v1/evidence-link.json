@@ -4,7 +4,7 @@
   "schemaVersion": "review-report@1",
   "reportId": "rr-fixture-001",
   "location": "report.json",
-  "sha256": "sha256:7b7a9746aea8b1a9d374028a2b2f76b60e82e2a108594a653bd8e2c78cd1f437",
+  "sha256": "sha256:98c951c6e565ea14d91c78b8cccc0310445bb3284e02990b548fc1e17c91182d",
   "targetSha256": "sha256:99f8971eb5ec8c6f48099fa1ff3f5b4db7db97efec81d9a94e601fd1a80de79e",
   "observedAt": 1784680000000
 }

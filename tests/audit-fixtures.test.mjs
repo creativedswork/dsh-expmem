@@ -42,6 +42,19 @@ test('review-report fixture binds report bytes and exact claim without parsing v
   }))
   assert.equal('verdict' in link, false)
   assert.equal('reviewers' in link, false)
+
+  // Four-model review: distinct providers, a valid verdict, and a
+  // cannotClaim self-limitation list on every reviewer.
+  assert.equal(report.reviewers.length, 4)
+  assert.deepEqual(
+    report.reviewers.map(reviewer => reviewer.provider).sort(),
+    ['claude', 'codex', 'gemini', 'glm'],
+  )
+  for (const reviewer of report.reviewers) {
+    assert.ok(['support', 'mixed', 'against', 'invalid'].includes(reviewer.verdict))
+    assert.ok(Array.isArray(reviewer.cannotClaim))
+    assert.ok(reviewer.cannotClaim.every(claim => typeof claim === 'string'))
+  }
 })
 
 test('fx-04 reports every rejected record while returning all valid records', async () => {
