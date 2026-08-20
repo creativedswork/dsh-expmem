@@ -65,6 +65,8 @@ try {
   assert.match(declarations, /claimSha256/)
   assert.match(declarations, /ExperienceTransitionInput/)
   assert.match(declarations, /MemoryTombstone/)
+  assert.match(declarations, /MemoryReflection/)
+  assert.match(declarations, /ReflectionPressure/)
 
   const command = join(installed, 'node_modules', '.bin', 'dsh-expmem')
   assert.match(execFileSync(command, ['--help'], { encoding: 'utf8' }), /import <claude\|codex\|all>/)

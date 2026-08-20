@@ -24,7 +24,9 @@ import {
   type ExperienceWriteInput,
   type MemoryActor,
   type MemoryEvidenceInput,
+  type MemoryReflection,
   type MemoryVerificationInput,
+  type ReflectionPressure,
 } from './storage.js'
 
 export type {
@@ -44,10 +46,13 @@ export type {
   MemoryActor,
   MemoryEvidence,
   MemoryEvidenceInput,
+  MemoryReflection,
   MemoryStatus,
   MemoryTombstone,
   MemoryVerification,
   MemoryVerificationInput,
+  ReflectionPressure,
+  ReflectionPressureRecord,
 } from './storage.js'
 export { FileExperienceArchive } from './storage.js'
 export { claimSha256, MemorySchemaError } from './schema.js'
@@ -79,6 +84,12 @@ export const DEFAULT_WARNING_RATIO = 0.7
 /** Default bound the pressure notice places on one promotion pass. */
 export const DEFAULT_MAX_PROMOTIONS_PER_CYCLE = 3
 
+/** Default importance accumulated before asking the agent to reflect. */
+export const DEFAULT_REFLECTION_THRESHOLD = 30
+
+/** Default hourly recency decay from Generative Agents. */
+export const DEFAULT_RECENCY_DECAY = 0.995
+
 /** Plugin configuration. */
 export interface Config {
   /** Absolute storage directory. Defaults to `$DSH_HOME/expmem` or `~/.dsh/expmem`. */
@@ -97,6 +108,12 @@ export interface Config {
   maxPromotionsPerCycle?: number
   /** Recover from threshold jumps by reading compacted events from Recall. Defaults to true. */
   recoveryAfterCompaction?: boolean
+  /** Ask the agent to synthesize higher-level reflections. Defaults to true. */
+  reflectionEnabled?: boolean
+  /** Importance accumulated before one reflection notice. Defaults to 30. */
+  reflectionThreshold?: number
+  /** Hourly retrieval recency decay. Defaults to 0.995. */
+  recencyDecay?: number
 }
 
 /** Runtime schema for Loader validation and defaults. */
@@ -109,6 +126,9 @@ export const Config: z<Config> = z.object({
   warningRatio: z.number().min(0).max(1).default(DEFAULT_WARNING_RATIO),
   maxPromotionsPerCycle: z.number().step(1).min(1).default(DEFAULT_MAX_PROMOTIONS_PER_CYCLE),
   recoveryAfterCompaction: z.boolean().default(true),
+  reflectionEnabled: z.boolean().default(true),
+  reflectionThreshold: z.number().step(1).min(1).default(DEFAULT_REFLECTION_THRESHOLD),
+  recencyDecay: z.number().min(0).max(1).default(DEFAULT_RECENCY_DECAY),
 })
 
 interface ResolvedConfig {
@@ -120,12 +140,17 @@ interface ResolvedConfig {
   warningRatio: number
   maxPromotionsPerCycle: number
   recoveryAfterCompaction: boolean
+  reflectionEnabled: boolean
+  reflectionThreshold: number
+  recencyDecay: number
 }
 
 const EXPMEM_PROMPT =
   'Use session_search or session_event_search for verbatim Recall from prior DSH sessions. '
   + 'Use expmem_search for distilled user habits, task experience, and reusable insights. '
   + 'Use expmem_write for stable candidate knowledge; update an existing candidate instead of duplicating it. '
+  + 'Assign importance from 1 to 10, and record higher-level insight reflections with cited source memory IDs. '
+  + 'Use ranked ExpMem results to personalize planning and reactions. '
   + 'Treat candidate and disputed memory as unverified, and use expmem_transition only with cited evidence. '
   + 'A review report is useful provenance but cannot verify a claim by itself. '
   + 'When ExpMem reports memory pressure, preserve the requested high-value records before continuing the task. '
@@ -133,6 +158,7 @@ const EXPMEM_PROMPT =
 
 const PRESSURE_NOTICE = 'ExpMem memory pressure'
 const RECOVERY_NOTICE = 'ExpMem post-compaction recovery'
+const REFLECTION_NOTICE = 'ExpMem reflection pressure'
 
 const JSON_OUTPUT = {
   schema: { type: 'json' as const },
@@ -159,7 +185,12 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   ctx.tools.register(forgetTool(archive))
 
   if (resolved.promotionEnabled) {
-    ctx.inject(['llm', 'tokenMeter'], runtime => registerPressurePromotion(runtime, resolved))
+    ctx.inject(
+      ['llm', 'tokenMeter'],
+      runtime => registerMemoryNotices(runtime, resolved, archive),
+    )
+  } else if (resolved.reflectionEnabled) {
+    registerMemoryNotices(ctx, resolved, archive)
   }
 }
 
@@ -174,9 +205,14 @@ interface PromotionState {
   warnedSinceCompaction: boolean
   pendingRecovery?: PendingRecovery
   summaries: Map<string, PendingRecovery>
+  lastReflectionFingerprint?: string
 }
 
-function registerPressurePromotion(ctx: Context, config: ResolvedConfig): void {
+function registerMemoryNotices(
+  ctx: Context,
+  config: ResolvedConfig,
+  archive: FileExperienceArchive,
+): void {
   const states = new WeakMap<Session, PromotionState>()
 
   ctx.on('agent/pre-step', async (
@@ -184,9 +220,12 @@ function registerPressurePromotion(ctx: Context, config: ResolvedConfig): void {
     next,
   ): Promise<PreStepDecision> => {
     const before = syncPromotionState(states, agent.session)
-    const recoveryPending = config.recoveryAfterCompaction
+    const recoveryPending = config.promotionEnabled
+      && config.recoveryAfterCompaction
       && before.pendingRecovery !== undefined
-    const ratio = before.warnedSinceCompaction || recoveryPending
+    const ratio = !config.promotionEnabled
+      || before.warnedSinceCompaction
+      || recoveryPending
       ? undefined
       : await contextPressure(ctx, agent, signal)
     const pressureWarning = ratio !== undefined && ratio >= config.warningRatio
@@ -195,7 +234,8 @@ function registerPressurePromotion(ctx: Context, config: ResolvedConfig): void {
 
     const after = syncPromotionState(states, agent.session)
     if (
-      config.recoveryAfterCompaction
+      config.promotionEnabled
+      && config.recoveryAfterCompaction
       && !after.warnedSinceCompaction
       && after.pendingRecovery !== undefined
     ) {
@@ -204,10 +244,24 @@ function registerPressurePromotion(ctx: Context, config: ResolvedConfig): void {
         recoveryMessage(agent, after.pendingRecovery, config.maxPromotionsPerCycle),
       )
     }
-    if (!pressureWarning || after.warnedSinceCompaction) return decision
+    if (pressureWarning && !after.warnedSinceCompaction) {
+      return appendPromotionNotice(
+        decision,
+        pressureMessage(ratio, config.maxPromotionsPerCycle),
+      )
+    }
+    if (!config.reflectionEnabled) return decision
+    const reflection = await archive.reflectionPressure(agent.session.header.cwd)
+    signal.throwIfAborted()
+    if (
+      reflection.totalImportance < config.reflectionThreshold
+      || reflection.fingerprint.length === 0
+      || after.lastReflectionFingerprint === reflection.fingerprint
+    ) return decision
+    after.lastReflectionFingerprint = reflection.fingerprint
     return appendPromotionNotice(
       decision,
-      pressureMessage(ratio, config.maxPromotionsPerCycle),
+      reflectionMessage(reflection, config.maxPromotionsPerCycle),
     )
   }, { prepend: true })
 }
@@ -226,8 +280,8 @@ function pressureMessage(ratio: number, maxPromotions: number) {
     '1. Use expmem_search before writing and update an existing record instead of duplicating it.',
     `2. Preserve at most ${maxPromotions} high-value records as candidates.`,
     '3. Use habit for stable user preferences, experience for reusable condition/action/outcome, and insight for generalizable engineering judgment.',
-    '4. Include inspectable evidence when available; do not promote a candidate without qualifying evidence.',
-    '5. Do not preserve secrets, raw logs, or transient progress.',
+    '4. Assign importance from 1 to 10 and include inspectable evidence when available.',
+    '5. Do not promote a candidate without qualifying evidence or preserve secrets, raw logs, or transient progress.',
     'Continue the original task after preservation.',
   ].join('\n')
   return createUserMessage({
@@ -258,6 +312,33 @@ function recoveryMessage(agent: Agent, recovery: PendingRecovery, maxPromotions:
       plugin: name,
       form: 'notice',
       summary: RECOVERY_NOTICE,
+    },
+  })
+}
+
+function reflectionMessage(reflection: ReflectionPressure, maxReflections: number) {
+  const records = reflection.records
+    .slice(0, 10)
+    .map(record =>
+      `- ${record.id} | ${record.status} | importance ${record.importance} | ${record.title}`)
+  const text = [
+    `ExpMem reflection pressure: ${reflection.totalImportance} importance points accumulated.`,
+    'Recent unreflected memories:',
+    ...records,
+    'Before continuing the original task:',
+    '1. Identify one to three high-level questions about recurring preferences, effective approaches, or engineering judgment.',
+    '2. Use expmem_search for each question and inspect the returned status and evidence.',
+    `3. Write at most ${maxReflections} insight candidates with importance and reflection { question, sourceMemoryIds }.`,
+    '4. Cite a complete Session event range when the source exists only in Recall.',
+    '5. Keep conclusions bounded by their sources. Reflection does not imply verification.',
+  ].join('\n')
+  return createUserMessage({
+    content: [{ type: 'text', text }],
+    source: {
+      kind: 'plugin',
+      plugin: name,
+      form: 'notice',
+      summary: REFLECTION_NOTICE,
     },
   })
 }
@@ -434,7 +515,7 @@ function searchTool(archive: FileExperienceArchive, config: ResolvedConfig): Too
       query: {
         type: 'string',
         required: true,
-        description: 'Case-insensitive search text. Space-separated terms are all required. Empty lists newest entries.',
+        description: 'Case-insensitive ranked query. Empty text ranks all matching records.',
       },
       kinds: {
         type: 'array',
@@ -463,11 +544,11 @@ function searchTool(archive: FileExperienceArchive, config: ResolvedConfig): Too
       },
     },
     output: JSON_OUTPUT,
-    isConcurrencySafe: () => true,
     async execute(args) {
       const options: ExperienceSearchOptions = {
         query: args.query,
         limit: args.limit ?? config.maxSearchResults,
+        recencyDecay: config.recencyDecay,
         ...args.workspace === undefined ? {} : { workspace: args.workspace },
         ...args.cursor === undefined ? {} : { cursor: args.cursor },
         ...args.kinds === undefined ? {} : { kinds: args.kinds },
@@ -525,6 +606,29 @@ function writeTool(archive: FileExperienceArchive): ToolDefinition {
         type: 'string',
         description: 'Optional human-readable evidence context; never verifies a claim.',
       },
+      importance: {
+        type: 'integer',
+        enum: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+        description: 'Personal significance from 1 (mundane) to 10 (highly consequential).',
+      },
+      reflection: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          question: {
+            type: 'string',
+            required: true,
+            description: 'High-level question answered by this insight.',
+          },
+          sourceMemoryIds: {
+            type: 'array',
+            items: { type: 'string' },
+            required: true,
+            description: 'ExpMem record UUIDs cited by this reflection.',
+          },
+        },
+        description: 'Reflection provenance. Valid only for insight records.',
+      },
     },
     output: JSON_OUTPUT,
     async execute(args, exec) {
@@ -542,6 +646,10 @@ function writeTool(archive: FileExperienceArchive): ToolDefinition {
           ? {}
           : { evidence: args.evidence as MemoryEvidenceInput[] },
         ...args.evidenceText === undefined ? {} : { evidenceText: args.evidenceText },
+        ...args.importance === undefined ? {} : { importance: args.importance },
+        ...args.reflection === undefined
+          ? {}
+          : { reflection: args.reflection as MemoryReflection },
       }
       return await archive.writeCandidate(write, sourceOf(exec)) as unknown as JsonValue
     },
@@ -670,6 +778,13 @@ function resolveConfig(config: Config): ResolvedConfig {
       'maxPromotionsPerCycle',
     ),
     recoveryAfterCompaction: config.recoveryAfterCompaction ?? true,
+    reflectionEnabled: config.reflectionEnabled ?? true,
+    reflectionThreshold: positiveInteger(
+      config.reflectionThreshold,
+      DEFAULT_REFLECTION_THRESHOLD,
+      'reflectionThreshold',
+    ),
+    recencyDecay: resolveRecencyDecay(config.recencyDecay),
   }
 }
 
@@ -677,6 +792,14 @@ function warningRatio(value: number | undefined): number {
   const resolved = value ?? DEFAULT_WARNING_RATIO
   if (!Number.isFinite(resolved) || resolved <= 0 || resolved >= 1) {
     throw new TypeError('expmem: warningRatio must be greater than 0 and less than 1')
+  }
+  return resolved
+}
+
+function resolveRecencyDecay(value: number | undefined): number {
+  const resolved = value ?? DEFAULT_RECENCY_DECAY
+  if (!Number.isFinite(resolved) || resolved <= 0 || resolved > 1) {
+    throw new TypeError('expmem: recencyDecay must be greater than 0 and no greater than 1')
   }
   return resolved
 }

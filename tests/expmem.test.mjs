@@ -50,6 +50,8 @@ test('provides file-backed experience memory over native DSH Recall', async () =
     assert.match(sections[0].text, /session_search/)
     assert.match(sections[0].text, /expmem_search/)
     assert.match(sections[0].text, /candidate/)
+    assert.match(sections[0].text, /importance/)
+    assert.match(sections[0].text, /personalize planning/)
 
     const exec = {
       signal: new AbortController().signal,
@@ -151,7 +153,7 @@ test('promotes once per compaction cycle and recovers threshold jumps from Recal
   })
 
   try {
-    await ctx.plugin(plugin, { rootDir })
+    await ctx.plugin(plugin, { rootDir, reflectionEnabled: false })
     const session = fakeSession('pressure-session')
     const agent = {
       id: session.id,
@@ -208,6 +210,128 @@ test('promotes once per compaction cycle and recovers threshold jumps from Recal
     })
     assert.equal(jumpedDecision.messages[0].source.summary, 'ExpMem post-compaction recovery')
     assert.match(jumpedDecision.messages[0].content[0].text, /events 5 through 55/)
+  } finally {
+    await ctx.fiber.dispose()
+    await rm(rootDir, { recursive: true, force: true })
+  }
+})
+
+test('requests one reflection per unchanged importance set and resets after reflection', async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), 'dsh-expmem-reflection-notice-'))
+  const definitions = new Map()
+  const ctx = new Context()
+  ctx.provide('tools', {
+    register(definition) {
+      definitions.set(definition.name, definition)
+      return () => definitions.delete(definition.name)
+    },
+  })
+  ctx.provide('systemPrompt', { section: () => () => undefined })
+
+  try {
+    await ctx.plugin(plugin, {
+      rootDir,
+      promotionEnabled: false,
+      reflectionThreshold: 10,
+    })
+    const session = fakeSession('reflection-session')
+    const agent = {
+      id: session.id,
+      options: {},
+      session,
+    }
+    const exec = {
+      signal: new AbortController().signal,
+      agent,
+    }
+    const first = await definitions.get('expmem_write').execute({
+      kind: 'experience',
+      title: 'Focused changes worked',
+      content: 'A focused implementation passed review.',
+      importance: 6,
+    }, exec)
+    const second = await definitions.get('expmem_write').execute({
+      kind: 'habit',
+      title: 'Evidence preference',
+      content: 'The user asks for evidence before conclusions.',
+      importance: 5,
+    }, exec)
+    const dispatch = () => ctx.waterfall('agent/pre-step', {
+      agent,
+      messages: [],
+      turn: 1,
+      step: 1,
+      signal: new AbortController().signal,
+    }, () => Promise.resolve({ kind: 'enter', messages: [] }))
+
+    const notice = (await dispatch()).messages[0]
+    assert.equal(notice.source.summary, 'ExpMem reflection pressure')
+    assert.match(notice.content[0].text, /11 importance points/)
+    assert.match(notice.content[0].text, new RegExp(first.id))
+    assert.match(notice.content[0].text, /sourceMemoryIds/)
+    assert.equal((await dispatch()).messages.length, 0)
+
+    await definitions.get('expmem_write').execute({
+      kind: 'insight',
+      title: 'Evidence-oriented collaboration',
+      content: 'Focused changes and evidence improve collaboration reliability.',
+      importance: 8,
+      reflection: {
+        question: 'Which collaboration approach repeatedly works?',
+        sourceMemoryIds: [first.id, second.id],
+      },
+    }, exec)
+    assert.equal((await dispatch()).messages.length, 0)
+  } finally {
+    await ctx.fiber.dispose()
+    await rm(rootDir, { recursive: true, force: true })
+  }
+})
+
+test('prioritizes context preservation when reflection pressure is also ready', async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), 'dsh-expmem-notice-priority-'))
+  const definitions = new Map()
+  const ctx = new Context()
+  ctx.provide('tools', {
+    register(definition) {
+      definitions.set(definition.name, definition)
+      return () => definitions.delete(definition.name)
+    },
+  })
+  ctx.provide('systemPrompt', { section: () => () => undefined })
+  ctx.provide('llm', {
+    resolveModelInfo: async () => ({ context: { contextWindow: 1000 } }),
+  })
+  ctx.provide('tokenMeter', {
+    measure: () => ({ totalTokens: 700 }),
+  })
+
+  try {
+    await ctx.plugin(plugin, { rootDir, reflectionThreshold: 1 })
+    const session = fakeSession('notice-priority-session')
+    const agent = {
+      id: session.id,
+      options: { provider: 'mock', model: 'mock' },
+      session,
+    }
+    await definitions.get('expmem_write').execute({
+      kind: 'experience',
+      title: 'Important observation',
+      content: 'This observation is ready for reflection.',
+      importance: 10,
+    }, {
+      signal: new AbortController().signal,
+      agent,
+    })
+    const decision = await ctx.waterfall('agent/pre-step', {
+      agent,
+      messages: [],
+      turn: 1,
+      step: 1,
+      signal: new AbortController().signal,
+    }, () => Promise.resolve({ kind: 'enter', messages: [] }))
+    assert.equal(decision.messages.length, 1)
+    assert.equal(decision.messages[0].source.summary, 'ExpMem memory pressure')
   } finally {
     await ctx.fiber.dispose()
     await rm(rootDir, { recursive: true, force: true })

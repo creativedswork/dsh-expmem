@@ -70,6 +70,8 @@ test('loads mixed legacy and v1 files without silently losing valid records', as
     const legacy = scan.memories.find(memory => memory.id === legacyId)
     assert.equal(legacy.status, 'candidate')
     assert.equal(legacy.schemaVersion, 1)
+    assert.equal(legacy.importance, 5)
+    assert.equal(legacy.lastAccessedAt, legacy.updatedAt)
     assert.deepEqual(legacy.authoredBy, { kind: 'agent', id: 'claude' })
     assert.equal(legacy.evidence[0].kind, 'imported-file')
     assert.equal(legacy.evidence[0].sha256, `sha256:${'a'.repeat(64)}`)
@@ -81,6 +83,152 @@ test('loads mixed legacy and v1 files without silently losing valid records', as
       archive.readRecord('experience', invalidId),
       /invalid ExpMem record/,
     )
+  } finally {
+    await rm(rootDir, { recursive: true, force: true })
+  }
+})
+
+test('ranks retrieval by recency importance and relevance, then touches only returned hits', async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), 'dsh-expmem-ranking-'))
+  const archive = new FileExperienceArchive(rootDir, LIMITS)
+
+  try {
+    await archive.initialize()
+    const important = await archive.writeCandidate({
+      kind: 'experience',
+      title: 'Important TypeScript note',
+      content: 'TypeScript requires focused type checks.',
+      importance: 10,
+    }, {})
+    const relevant = await archive.writeCandidate({
+      kind: 'experience',
+      title: 'Relevant TypeScript memory',
+      content: 'TypeScript memory ranking uses all query terms.',
+      importance: 1,
+    }, {})
+    const importantPath = join(
+      rootDir,
+      'archive',
+      important.kind,
+      `${important.id}.json`,
+    )
+    const relevantPath = join(
+      rootDir,
+      'archive',
+      relevant.kind,
+      `${relevant.id}.json`,
+    )
+    const importantStored = JSON.parse(await readFile(importantPath, 'utf8'))
+    const relevantStored = JSON.parse(await readFile(relevantPath, 'utf8'))
+    const now = Date.now()
+    importantStored.lastAccessedAt = now - 10 * 3_600_000
+    relevantStored.lastAccessedAt = now - 3_600_000
+    await writeFile(importantPath, `${JSON.stringify(importantStored, null, 2)}\n`)
+    await writeFile(relevantPath, `${JSON.stringify(relevantStored, null, 2)}\n`)
+
+    const page = await archive.search({
+      query: 'TypeScript memory',
+      limit: 1,
+      recencyDecay: 0.5,
+    })
+    assert.equal(page.hits[0].id, relevant.id)
+    assert.equal(page.hits[0].score, 2)
+    assert.deepEqual(page.hits[0].scoreComponents, {
+      recency: 1,
+      importance: 0,
+      relevance: 1,
+    })
+    assert.equal(page.nextCursor, '1')
+    assert.equal((await archive.readRecord(important.kind, important.id)).lastAccessedAt,
+      importantStored.lastAccessedAt)
+    assert.ok((await archive.readRecord(relevant.kind, relevant.id)).lastAccessedAt
+      > relevantStored.lastAccessedAt)
+  } finally {
+    await rm(rootDir, { recursive: true, force: true })
+  }
+})
+
+test('stores auditable recursive reflections and rejects invalid source graphs', async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), 'dsh-expmem-reflection-'))
+  const archive = new FileExperienceArchive(rootDir, LIMITS)
+
+  try {
+    await archive.initialize()
+    const first = await archive.writeCandidate({
+      kind: 'experience',
+      title: 'First observation',
+      content: 'Focused diffs reduce review risk.',
+      importance: 8,
+    }, {})
+    const second = await archive.writeCandidate({
+      kind: 'habit',
+      title: 'Second observation',
+      content: 'The user prefers evidence before conclusions.',
+      importance: 7,
+    }, {})
+    assert.equal((await archive.reflectionPressure()).totalImportance, 15)
+
+    const reflection = await archive.writeCandidate({
+      kind: 'insight',
+      title: 'Evidence-oriented implementation style',
+      content: 'Use focused changes and verify claims before presenting conclusions.',
+      importance: 9,
+      reflection: {
+        question: 'Which implementation style consistently works for this user?',
+        sourceMemoryIds: [first.id, second.id],
+      },
+    }, {})
+    assert.deepEqual(reflection.reflection.sourceMemoryIds, [first.id, second.id])
+    assert.equal((await archive.reflectionPressure()).totalImportance, 0)
+
+    const recursive = await archive.writeCandidate({
+      kind: 'insight',
+      title: 'Reusable collaboration pattern',
+      content: 'Evidence-oriented implementation supports reliable collaboration.',
+      importance: 8,
+      reflection: {
+        question: 'What broader collaboration pattern follows from prior insights?',
+        sourceMemoryIds: [reflection.id],
+      },
+    }, {})
+    assert.deepEqual(recursive.reflection.sourceMemoryIds, [reflection.id])
+
+    await assert.rejects(archive.writeCandidate({
+      kind: 'insight',
+      title: 'Missing source',
+      content: 'This reflection cites no live record.',
+      reflection: {
+        question: 'Can a missing source support a reflection?',
+        sourceMemoryIds: ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'],
+      },
+    }, {}), /reflection source is missing/)
+    await assert.rejects(archive.writeCandidate({
+      kind: 'experience',
+      title: 'Wrong kind',
+      content: 'Only insight records may be reflections.',
+      reflection: {
+        question: 'Is this a reflection?',
+        sourceMemoryIds: [first.id],
+      },
+    }, {}), /only insight memory may be a reflection/)
+    await assert.rejects(archive.writeCandidate({
+      id: reflection.id,
+      kind: reflection.kind,
+      title: reflection.title,
+      content: reflection.content,
+      importance: reflection.importance,
+      evidence: reflection.evidence,
+      reflection: {
+        question: reflection.reflection.question,
+        sourceMemoryIds: [recursive.id],
+      },
+    }, {}), /reflection cycle/)
+    await assert.rejects(archive.writeCandidate({
+      kind: 'experience',
+      title: 'Invalid importance',
+      content: 'Importance is bounded.',
+      importance: 11,
+    }, {}), /importance must be an integer from 1 to 10/)
   } finally {
     await rm(rootDir, { recursive: true, force: true })
   }

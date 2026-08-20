@@ -4,53 +4,75 @@ English | [简体中文](README.zh-CN.md)
 
 **Experience Memory for DeepSeek Harness.**
 
-DSH ExpMem is a community plugin, not an official DeepSeek project. It gives a DSH agent a file-backed Archive for distilled user habits, task experience, and reusable insights while reusing DSH's existing session history as Recall.
+## Introduction
+
+DSH ExpMem is a community plugin for long-term personal memory in
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). It keeps user habits,
+reusable task experience, and engineering insights in inspectable local files. DSH's existing
+Session history remains the verbatim Recall layer.
+
+The design combines two research lines. MemGPT supplies the memory infrastructure: tiered
+storage, memory pressure, retrieval, and explicit memory operations. Generative Agents supplies
+the cognitive process: assign importance, retrieve by current relevance, synthesize reflections,
+and use those memories when planning the next action.
+
+DSH ExpMem is not an official DeepSeek project.
 
 ## Architecture
 
 ```mermaid
-flowchart LR
-  Agent["DSH Agent"]
-  Sources["Claude Code / Codex<br/>Markdown memory"]
+flowchart TB
+  subgraph Runtime["DeepSeek Harness runtime"]
+    Agent["DSH Agent"]
+    Meter["Token Meter"]
+    Sessions["Session Persistence<br/>JSONL"]
+  end
 
-  Agent -->|"search / write / transition / forget"| Archive["ExpMem Archive<br/>JSON files"]
-  Agent -->|"session_search / event_search"| Query["DSH Session Query<br/>SQLite FTS index"]
-  Meter["DSH Token Meter"] -->|"70% pressure notice"| Agent
-  Query --> Recall["DSH Recall<br/>session JSONL"]
-  Sources -->|"dsh-expmem import"| Archive
+  subgraph Memory["MemGPT-style memory infrastructure"]
+    Recall["Recall<br/>verbatim session history"]
+    Archive["ExpMem Archive<br/>local JSON records"]
+  end
 
-  Archive --> Habits["Habits"]
-  Archive --> Experience["Task experience"]
-  Archive --> Insights["Insights"]
+  subgraph Cognition["Generative Agents-style cognitive loop"]
+    Retrieve["Retrieve<br/>relevance + recency + importance"]
+    Reflect["Reflect<br/>insights with cited sources"]
+    Plan["Plan and act<br/>inside the DSH agent loop"]
+  end
+
+  Sources["Claude Code / Codex<br/>Markdown memory"] -->|"idempotent import"| Archive
+  Sessions --> Recall
+  Meter -->|"70% context pressure"| Agent
+  Recall --> Retrieve
+  Archive --> Retrieve
+  Retrieve --> Agent
+  Agent -->|"promote durable experience"| Archive
+  Agent --> Reflect
+  Reflect --> Archive
+  Agent --> Plan
 ```
 
-- **Recall** is verbatim prior-session history. DSH already stores it in JSONL and provides search through `dsh-session-query`.
-- **Archive** is knowledge deliberately distilled by the agent. Each JSON record carries its trust status, author, and evidence.
-- **Pressure promotion** asks the current agent to preserve high-value experience before DSH compacts the context.
-- ExpMem does not duplicate session events or modify the Agent Loop.
+DSH owns Recall, context compaction, and the Agent Loop. ExpMem owns the distilled Archive,
+retrieval ranking, reflection provenance, and the trustworthy memory lifecycle. It does not copy
+Session events.
 
-## Install
+## Highlights
 
-```sh
-dsh plugin --profile web add @creative-dswork/dsh-expmem
-```
+- **Tiered memory:** DSH Session JSONL holds raw history; ExpMem stores habits, experience, and
+  insights as one JSON file per record.
+- **Pressure-aware promotion:** a 70% context notice asks the current agent to preserve durable
+  knowledge before compaction. Recall recovery covers threshold jumps.
+- **Personalized retrieval:** search combines relevance, recency, and agent-assigned importance.
+  Returned memories condition later planning and reactions.
+- **Auditable reflection:** higher-level insights cite the observations or earlier reflections
+  that support them. ExpMem rejects dangling links, self-links, and cycles.
+- **Trust lifecycle:** candidate, verified, disputed, and superseded states preserve provenance,
+  conflicts, and replacement history. Confirmed deletion leaves a minimal tombstone.
+- **Local and lightweight:** ExpMem adds no vector database, background worker, or second model
+  request. It does not modify the DSH Agent Loop.
 
-The bundle:
+## Claude Code and Codex compatibility
 
-1. enables the existing DSH session-query SQLite backend on first search;
-2. adds DSH's `session_search`, `session_event_search`, trace, and read tools;
-3. adds `expmem_search`, `expmem_write`, `expmem_transition`, and `expmem_forget`;
-4. enables one ExpMem promotion notice per DSH compaction cycle.
-
-Start DSH normally:
-
-```sh
-dsh web
-```
-
-## Import Claude Code and Codex Memory
-
-Preview and then import both agents' generated Markdown memories:
+ExpMem imports the agent-generated Markdown memories from both tools:
 
 ```sh
 pnpm dlx @creative-dswork/dsh-expmem import all --dry-run
@@ -75,6 +97,46 @@ ExpMem never modifies or deletes source files. Use `--workspace /path/to/project
 explicit project scope; the default Claude layout is mapped to its project when that mapping is
 unambiguous.
 
+## Research foundations
+
+### MemGPT
+
+[MemGPT: Towards LLMs as Operating Systems](https://arxiv.org/abs/2310.08560) treats an LLM's
+context window as scarce working memory and moves information through a storage hierarchy.
+ExpMem applies four parts of that design:
+
+- DSH context is the working set;
+- DSH Session history is Recall;
+- ExpMem JSON records are the Archival store;
+- pressure notices give the agent time to preserve important experience before compaction.
+
+### Generative Agents
+
+[Generative Agents: Interactive Simulacra of Human Behavior](https://arxiv.org/abs/2304.03442)
+describes a memory stream that supports retrieval, reflection, and planning. ExpMem applies its
+memory-specific mechanisms:
+
+- each record carries importance and a most recent access time;
+- retrieval combines relevance, recency, and importance;
+- reflections are insight records with citations to their source memories;
+- accumulated importance triggers reflection by the current agent.
+
+Active plans stay in DSH task and Session state because they change during execution. ExpMem
+stores the durable habits, experience, and reflections that should influence later plans.
+
+## Install
+
+```sh
+dsh plugin --profile web add @creative-dswork/dsh-expmem
+```
+
+The bundle enables DSH Session Query, registers the Recall and ExpMem tools, and installs memory
+pressure and reflection notices. Start DSH normally:
+
+```sh
+dsh web
+```
+
 ## Storage
 
 The default files are:
@@ -92,8 +154,8 @@ $DSH_HOME/
 ```
 
 Schema v1 records contain the claim, `candidate|verified|disputed|superseded` status, author,
-evidence, timestamps, optional workspace, and record relations. ExpMem reads 0.2.x records as
-v1 candidates in memory and writes v1 on their next update. A malformed or future-version file
+evidence, importance, last access time, optional workspace, and record relations. ExpMem reads
+0.2.x and earlier v1 records with compatible defaults. A malformed or future-version file
 produces a scan warning without hiding valid records in the same directory.
 
 Each write creates a temporary file in the target directory and atomically renames it. Searches
@@ -117,14 +179,36 @@ External review reports are opaque evidence. ExpMem stores the report schema, ID
 report SHA-256, and the SHA-256 of the exact claim reviewed. It does not open report locations,
 parse verdicts, run review models, or grant `verified` from a report alone.
 
+## Ranked retrieval and reflection
+
+Each memory has an `importance` score from 1 to 10 and a `lastAccessedAt` timestamp. Search ranks
+matching records with the three factors from *Generative Agents*:
+
+```text
+score = normalized(recency) + normalized(importance) + normalized(relevance)
+recency = 0.995 ^ hours_since_last_access
+```
+
+Relevance is literal query-term coverage. Search updates `lastAccessedAt` only for hits returned
+to the agent.
+
+An insight may include `reflection: { question, sourceMemoryIds }`. The source IDs form an
+auditable reflection tree and may point to observations or earlier reflections. A reflection
+with no ExpMem source must cite a complete DSH Session event range.
+
+After unreflected memories accumulate 30 importance points, ExpMem injects one reflection notice.
+The current agent formulates salient questions, retrieves related records, and writes up to three
+insight candidates. ExpMem makes no second model call. Active plans remain in DSH task and Session
+state rather than the long-term Archive.
+
 ## Tools
 
 | Tool | Purpose |
 |---|---|
 | `session_search` | Find relevant prior sessions in the current workspace. |
 | `session_event_search` | Search events inside one prior session. |
-| `expmem_search` | Search distilled experience across projects or one exact workspace. |
-| `expmem_write` | Create or update a candidate record. |
+| `expmem_search` | Rank relevant experience by recency, importance, and relevance. |
+| `expmem_write` | Create or update a candidate, including importance and reflection provenance. |
 | `expmem_transition` | Verify or dispute a record with evidence; add conflicts or supersession. |
 | `expmem_forget` | Delete a candidate and leave a minimal tombstone. |
 
@@ -173,9 +257,13 @@ Override the `expmem` row in the profile's `cordis.patch.yml`:
     warningRatio: 0.7
     maxPromotionsPerCycle: 3
     recoveryAfterCompaction: true
+    reflectionEnabled: true
+    reflectionThreshold: 30
+    recencyDecay: 0.995
 ```
 
-`rootDir` must be absolute. Search is a case-insensitive literal AND over whitespace-separated terms. An empty query lists the newest records.
+`rootDir` must be absolute. Search considers records matching at least one case-insensitive
+literal term, then ranks them. An empty query ranks all records allowed by the filters.
 Pressure promotion activates only when the active DSH composition provides both the token meter
 and model context-window metadata.
 

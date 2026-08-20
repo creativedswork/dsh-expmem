@@ -25,6 +25,7 @@ import {
   type MemoryActor,
   type MemoryEvidence,
   type MemoryEvidenceInput,
+  type MemoryReflection,
   type MemoryStatus,
   type MemoryTombstone,
   type MemoryVerification,
@@ -39,6 +40,7 @@ export type {
   MemoryActor,
   MemoryEvidence,
   MemoryEvidenceInput,
+  MemoryReflection,
   MemoryStatus,
   MemoryTombstone,
   MemoryVerification,
@@ -57,12 +59,21 @@ export interface ExperienceSearchHit {
   status: MemoryStatus
   authoredBy: MemoryActor
   evidence: MemoryEvidence[]
+  importance: number
+  lastAccessedAt: number
+  score: number
+  scoreComponents: {
+    recency: number
+    importance: number
+    relevance: number
+  }
   claimSha256: string
   workspace?: string
   verification?: MemoryVerification
   supersedes?: string[]
   supersededBy?: string
   conflictsWith?: string[]
+  reflection?: MemoryReflection
   importedFrom?: ImportedMemorySource
 }
 
@@ -84,6 +95,8 @@ export interface ExperienceWriteInput {
   evidence?: MemoryEvidenceInput[]
   evidenceText?: string
   claimedAt?: number
+  importance?: number
+  reflection?: MemoryReflection
   /** @deprecated Use imported-file evidence. */
   importedFrom?: ImportedMemorySource
 }
@@ -115,6 +128,7 @@ export interface ExperienceSearchOptions {
   workspace?: string
   limit: number
   cursor?: string
+  recencyDecay?: number
 }
 
 /** Deployment limits resolved by the plugin. */
@@ -133,6 +147,22 @@ export interface ArchiveWarning {
 export interface ArchiveScanResult {
   memories: ExperienceMemory[]
   warnings: ArchiveWarning[]
+}
+
+export interface ReflectionPressureRecord {
+  id: string
+  kind: ExperienceKind
+  title: string
+  status: MemoryStatus
+  importance: number
+  updatedAt: number
+}
+
+export interface ReflectionPressure {
+  totalImportance: number
+  fingerprint: string
+  latestReflectionAt?: number
+  records: ReflectionPressureRecord[]
 }
 
 interface LoadedArchive extends ArchiveScanResult {
@@ -203,6 +233,8 @@ export class FileExperienceArchive {
         ?? source.actor
         ?? { kind: 'agent', ...(source.sessionId === undefined ? {} : { id: source.sessionId }) },
       evidence,
+      importance: input.importance ?? previous?.importance ?? 5,
+      lastAccessedAt: previous?.lastAccessedAt ?? now,
       createdAt: previous?.createdAt ?? now,
       updatedAt: now,
       ...(input.evidenceText === undefined
@@ -214,7 +246,11 @@ export class FileExperienceArchive {
       ...(source.workspace === undefined
         ? previous?.workspace === undefined ? {} : { workspace: previous.workspace }
         : { workspace: source.workspace }),
+      ...(input.reflection === undefined
+        ? previous?.reflection === undefined ? {} : { reflection: previous.reflection }
+        : { reflection: input.reflection }),
     })
+    await this.validateReflection(memory, previous)
     await atomicJsonWrite(this.memoryPath(memory.kind, memory.id), memory)
     return memory
   }
@@ -365,7 +401,7 @@ export class FileExperienceArchive {
     return (await this.scan()).memories
   }
 
-  /** Search the Archive using case-insensitive AND terms. */
+  /** Search the Archive using Generative Agents-style ranked retrieval. */
   async search(options: ExperienceSearchOptions): Promise<ExperienceSearchPage> {
     const offset = parseCursor(options.cursor)
     if (!Number.isSafeInteger(options.limit)
@@ -376,11 +412,21 @@ export class FileExperienceArchive {
     if (options.statuses?.some(status => !isMemoryStatus(status))) {
       throw new Error('invalid ExpMem status filter')
     }
+    const recencyDecay = options.recencyDecay ?? 0.995
+    if (!Number.isFinite(recencyDecay) || recencyDecay <= 0 || recencyDecay > 1) {
+      throw new Error('recencyDecay must be greater than 0 and no greater than 1')
+    }
     const statuses = options.statuses ?? ['candidate', 'verified', 'disputed']
     const terms = options.query.trim().toLocaleLowerCase().split(/\s+/u).filter(Boolean)
     const loaded = await this.loadArchive()
     const resolved = resolveArchive(loaded.memories)
-    const hits: ExperienceSearchHit[] = []
+    const now = Date.now()
+    const candidates: Array<{
+      memory: ExperienceMemory
+      recency: number
+      importance: number
+      relevance: number
+    }> = []
 
     // ponytail: linear scans keep files transparent; add an index only when corpus size requires it.
     for (const memory of resolved.memories) {
@@ -396,15 +442,53 @@ export class FileExperienceArchive {
         memory.workspace ?? '',
         JSON.stringify(memory.authoredBy),
         JSON.stringify(memory.evidence),
+        JSON.stringify(memory.reflection ?? ''),
       ].join('\n').toLocaleLowerCase()
-      if (!terms.every(term => searchable.includes(term))) continue
+      const matchedTerms = terms.filter(term => searchable.includes(term)).length
+      if (terms.length > 0 && matchedTerms === 0) continue
+      const elapsedHours = Math.max(0, now - memory.lastAccessedAt) / 3_600_000
+      candidates.push({
+        memory,
+        recency: recencyDecay ** elapsedHours,
+        importance: memory.importance,
+        relevance: terms.length === 0 ? 0 : matchedTerms / terms.length,
+      })
+    }
+
+    const normalizedRecency = normalizeScores(candidates.map(candidate => candidate.recency))
+    const normalizedImportance = normalizeScores(
+      candidates.map(candidate => candidate.importance),
+    )
+    const normalizedRelevance = normalizeScores(candidates.map(candidate => candidate.relevance))
+    const ranked = candidates.map((candidate, index) => {
+      const scoreComponents = {
+        recency: normalizedRecency[index]!,
+        importance: normalizedImportance[index]!,
+        relevance: normalizedRelevance[index]!,
+      }
+      return {
+        memory: candidate.memory,
+        scoreComponents,
+        score: scoreComponents.recency
+          + scoreComponents.importance
+          + scoreComponents.relevance,
+      }
+    })
+    ranked.sort((left, right) =>
+      right.score - left.score
+      || right.memory.updatedAt - left.memory.updatedAt
+      || left.memory.id.localeCompare(right.memory.id))
+
+    const pageCandidates = ranked.slice(offset, offset + options.limit)
+    const hits: ExperienceSearchHit[] = pageCandidates.map(candidate => {
+      const memory = candidate.memory
       const imported = memory.evidence.find(
         (item): item is Extract<MemoryEvidence, { kind: 'imported-file' }> =>
           item.kind === 'imported-file',
       )
       const supersededBy = resolved.supersededBy.get(memory.id)
       const conflicts = [...resolved.conflicts.get(memory.id) ?? []].sort()
-      hits.push({
+      return {
         id: memory.id,
         kind: memory.kind,
         title: memory.title,
@@ -415,12 +499,21 @@ export class FileExperienceArchive {
         status: memory.status,
         authoredBy: memory.authoredBy,
         evidence: memory.evidence,
+        importance: memory.importance,
+        lastAccessedAt: now,
+        score: roundedScore(candidate.score),
+        scoreComponents: {
+          recency: roundedScore(candidate.scoreComponents.recency),
+          importance: roundedScore(candidate.scoreComponents.importance),
+          relevance: roundedScore(candidate.scoreComponents.relevance),
+        },
         claimSha256: claimSha256(memory),
         ...(memory.workspace === undefined ? {} : { workspace: memory.workspace }),
         ...(memory.verification === undefined ? {} : { verification: memory.verification }),
         ...(memory.supersedes === undefined ? {} : { supersedes: memory.supersedes }),
         ...(supersededBy === undefined ? {} : { supersededBy }),
         ...(conflicts.length === 0 ? {} : { conflictsWith: conflicts }),
+        ...(memory.reflection === undefined ? {} : { reflection: memory.reflection }),
         ...(imported === undefined
           ? {}
           : {
@@ -430,15 +523,88 @@ export class FileExperienceArchive {
                 sha256: imported.sha256,
               },
             }),
-      })
-    }
-    hits.sort((left, right) => right.timestamp - left.timestamp || left.id.localeCompare(right.id))
-    const page = hits.slice(offset, offset + options.limit)
-    const nextOffset = offset + page.length
+      }
+    })
+    await this.touchMemories(hits.map(hit => hit.id), now, loaded.memories)
+    const nextOffset = offset + hits.length
     return {
-      hits: page,
+      hits,
       warnings: loaded.warnings,
-      ...(nextOffset < hits.length ? { nextCursor: String(nextOffset) } : {}),
+      ...(nextOffset < ranked.length ? { nextCursor: String(nextOffset) } : {}),
+    }
+  }
+
+  /** Summarize unreflected importance for one workspace. */
+  async reflectionPressure(workspace?: string): Promise<ReflectionPressure> {
+    const loaded = await this.loadArchive()
+    const memories = resolveArchive(loaded.memories).memories.filter(memory =>
+      memory.status !== 'superseded'
+      && (workspace === undefined || memory.workspace === workspace))
+    const latestReflectionAt = memories.reduce<number | undefined>(
+      (latest, memory) => memory.reflection === undefined
+        ? latest
+        : Math.max(latest ?? 0, memory.createdAt),
+      undefined,
+    )
+    const records = memories
+      .filter(memory =>
+        memory.reflection === undefined
+        && (latestReflectionAt === undefined || memory.updatedAt > latestReflectionAt))
+      .map(memory => ({
+        id: memory.id,
+        kind: memory.kind,
+        title: memory.title,
+        status: memory.status,
+        importance: memory.importance,
+        updatedAt: memory.updatedAt,
+      }))
+      .sort((left, right) => right.updatedAt - left.updatedAt || left.id.localeCompare(right.id))
+    const fingerprint = [...records]
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .map(record => `${record.id}:${record.updatedAt}:${record.importance}`)
+      .join('|')
+    return {
+      totalImportance: records.reduce((total, record) => total + record.importance, 0),
+      fingerprint,
+      ...(latestReflectionAt === undefined ? {} : { latestReflectionAt }),
+      records,
+    }
+  }
+
+  private async validateReflection(
+    memory: ExperienceMemory,
+    previous: ExperienceMemory | undefined,
+  ): Promise<void> {
+    if (memory.reflection === undefined) return
+    const loaded = await this.loadArchive()
+    const liveIds = new Set(loaded.memories.map(record => record.id))
+    const previousSources = new Set(previous?.reflection?.sourceMemoryIds ?? [])
+    for (const sourceId of memory.reflection.sourceMemoryIds) {
+      if (!liveIds.has(sourceId) && !previousSources.has(sourceId)) {
+        const deleted = loaded.tombstones.has(sourceId) ? 'deleted' : 'missing'
+        throw new Error(`ExpMem reflection source is ${deleted}: ${sourceId}`)
+      }
+    }
+    const records = [
+      ...loaded.memories.filter(record => record.id !== memory.id),
+      memory,
+    ]
+    validateReflectionGraph(records)
+  }
+
+  private async touchMemories(
+    ids: string[],
+    accessedAt: number,
+    memories: ExperienceMemory[],
+  ): Promise<void> {
+    const byId = new Map(memories.map(memory => [memory.id, memory]))
+    for (const id of ids) {
+      const memory = byId.get(id)
+      if (memory === undefined) continue
+      await atomicJsonWrite(this.memoryPath(memory.kind, memory.id), normalizeMemory({
+        ...memory,
+        lastAccessedAt: accessedAt,
+      }))
     }
   }
 
@@ -582,6 +748,25 @@ function validateSupersessionGraph(memories: ExperienceMemory[]): void {
   for (const id of edges.keys()) visit(id)
 }
 
+function validateReflectionGraph(memories: ExperienceMemory[]): void {
+  const edges = new Map(
+    memories.map(memory => [memory.id, memory.reflection?.sourceMemoryIds ?? []]),
+  )
+  const visiting = new Set<string>()
+  const visited = new Set<string>()
+  const visit = (id: string): void => {
+    if (visiting.has(id)) throw new Error(`ExpMem reflection cycle includes ${id}`)
+    if (visited.has(id)) return
+    visiting.add(id)
+    for (const sourceId of edges.get(id) ?? []) {
+      if (edges.has(sourceId)) visit(sourceId)
+    }
+    visiting.delete(id)
+    visited.add(id)
+  }
+  for (const id of edges.keys()) visit(id)
+}
+
 function validTransition(from: MemoryStatus, to: 'verified' | 'disputed'): boolean {
   return (from === 'candidate' && (to === 'verified' || to === 'disputed'))
     || (from === 'verified' && (to === 'verified' || to === 'disputed'))
@@ -690,6 +875,18 @@ function parseCursor(cursor: string | undefined): number {
 
 function preview(text: string, maxChars: number): string {
   return text.length <= maxChars ? text : `${text.slice(0, maxChars)}...`
+}
+
+function normalizeScores(values: number[]): number[] {
+  if (values.length === 0) return []
+  const minimum = Math.min(...values)
+  const maximum = Math.max(...values)
+  if (minimum === maximum) return values.map(() => 0)
+  return values.map(value => (value - minimum) / (maximum - minimum))
+}
+
+function roundedScore(value: number): number {
+  return Math.round(value * 1_000_000) / 1_000_000
 }
 
 function requiredText(value: string, name: string): string {

@@ -98,6 +98,11 @@ export interface MemoryVerificationInput {
   verifiedAt?: number
 }
 
+export interface MemoryReflection {
+  question: string
+  sourceMemoryIds: string[]
+}
+
 export interface ExperienceMemory {
   schemaVersion: 1
   id: string
@@ -108,6 +113,8 @@ export interface ExperienceMemory {
   status: MemoryStatus
   authoredBy: MemoryActor
   evidence: MemoryEvidence[]
+  importance: number
+  lastAccessedAt: number
   evidenceText?: string
   createdAt: number
   updatedAt: number
@@ -116,6 +123,7 @@ export interface ExperienceMemory {
   verification?: MemoryVerification
   supersedes?: string[]
   conflictsWith?: string[]
+  reflection?: MemoryReflection
 }
 
 export interface MemoryTombstone {
@@ -249,12 +257,21 @@ function normalizeV1(value: Record<string, unknown>): ExperienceMemory {
   }
   const createdAt = timestamp(value.createdAt, 'createdAt')
   const updatedAt = timestamp(value.updatedAt, 'updatedAt')
+  const importance = value.importance === undefined
+    ? 5
+    : importanceScore(value.importance)
+  const lastAccessedAt = value.lastAccessedAt === undefined
+    ? updatedAt
+    : timestamp(value.lastAccessedAt, 'lastAccessedAt')
   const claimedAt = optionalTimestamp(value.claimedAt, 'claimedAt')
   const verification = value.verification === undefined
     ? undefined
     : normalizeVerification(value.verification)
   const supersedes = optionalIds(value.supersedes, 'supersedes')
   const conflictsWith = optionalIds(value.conflictsWith, 'conflictsWith')
+  const reflection = value.reflection === undefined
+    ? undefined
+    : normalizeReflection(value.reflection)
   const memory: ExperienceMemory = {
     schemaVersion: 1,
     id: value.id,
@@ -265,6 +282,8 @@ function normalizeV1(value: Record<string, unknown>): ExperienceMemory {
     status: value.status,
     authoredBy,
     evidence,
+    importance,
+    lastAccessedAt,
     createdAt,
     updatedAt,
     ...optionalString(value.evidenceText, 'evidenceText'),
@@ -273,6 +292,7 @@ function normalizeV1(value: Record<string, unknown>): ExperienceMemory {
     ...(verification === undefined ? {} : { verification }),
     ...(supersedes === undefined ? {} : { supersedes }),
     ...(conflictsWith === undefined ? {} : { conflictsWith }),
+    ...(reflection === undefined ? {} : { reflection }),
   }
   validateRecord(memory)
   return memory
@@ -283,6 +303,7 @@ function normalizeLegacy(value: Record<string, unknown>): ExperienceMemory {
   if (!isMemoryId(value.id)) invalid('legacy id must be a UUID')
   if (!isExperienceKind(value.kind)) invalid('invalid legacy memory kind')
   const createdAt = timestamp(value.createdAt, 'createdAt')
+  const updatedAt = timestamp(value.updatedAt, 'updatedAt')
   const evidence: MemoryEvidence[] = []
   const imported = value.importedFrom
   if (imported !== undefined) {
@@ -327,8 +348,10 @@ function normalizeLegacy(value: Record<string, unknown>): ExperienceMemory {
         }
       : { kind: 'agent', id: imported.provider as 'claude' | 'codex' },
     evidence,
+    importance: 5,
+    lastAccessedAt: updatedAt,
     createdAt,
-    updatedAt: timestamp(value.updatedAt, 'updatedAt'),
+    updatedAt,
     ...optionalString(value.workspace, 'workspace'),
   }
   validateRecord(memory)
@@ -357,6 +380,16 @@ function validateRecord(memory: ExperienceMemory): void {
   if (memory.authoredBy.kind === 'user'
     && !memory.evidence.some(isCompleteSessionEvidence)) {
     invalid('user-authored memory requires complete Session evidence')
+  }
+  if (memory.reflection !== undefined) {
+    if (memory.kind !== 'insight') invalid('only insight memory may be a reflection')
+    if (memory.reflection.sourceMemoryIds.includes(memory.id)) {
+      invalid('reflection cannot reference itself')
+    }
+    if (memory.reflection.sourceMemoryIds.length === 0
+      && !memory.evidence.some(isCompleteSessionEvidence)) {
+      invalid('reflection requires source memories or complete Session evidence')
+    }
   }
   for (const report of memory.evidence.filter(
     (item): item is Extract<MemoryEvidence, { kind: 'review-report' }> =>
@@ -484,6 +517,14 @@ function normalizeVerification(value: unknown): MemoryVerification {
   }
 }
 
+function normalizeReflection(value: unknown): MemoryReflection {
+  if (!isRecord(value)) invalid('invalid reflection')
+  return {
+    question: nonEmpty(value.question, 'reflection question'),
+    sourceMemoryIds: ids(value.sourceMemoryIds, 'reflection sourceMemoryIds'),
+  }
+}
+
 function deterministicUuid(seed: string): string {
   const value = createHash('sha256').update(seed).digest('hex').slice(0, 32).split('')
   value[12] = '4'
@@ -520,6 +561,13 @@ function timestamp(value: unknown, name: string): number {
 
 function optionalTimestamp(value: unknown, name: string): number | undefined {
   return value === undefined ? undefined : timestamp(value, name)
+}
+
+function importanceScore(value: unknown): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 1 || (value as number) > 10) {
+    invalid('importance must be an integer from 1 to 10')
+  }
+  return value as number
 }
 
 function isTimestamp(value: unknown): value is number {
