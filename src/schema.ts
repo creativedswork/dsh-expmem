@@ -101,6 +101,38 @@ export interface MemoryVerificationInput {
 export interface MemoryReflection {
   question: string
   sourceMemoryIds: string[]
+  runId?: string
+  questionId?: string
+}
+
+export type ReflectionRunStatus = 'pending' | 'prepared' | 'completed'
+
+export interface ReflectionRunSource {
+  memoryId: string
+  claimSha256: string
+  updatedAt: number
+  importance: number
+}
+
+export interface ReflectionRunQuestion {
+  id: string
+  text: string
+  retrievedMemoryIds: string[]
+}
+
+export interface ReflectionRun {
+  schemaVersion: 'reflection-run@1'
+  id: string
+  status: ReflectionRunStatus
+  sourceMemories: ReflectionRunSource[]
+  totalImportance: number
+  questions: ReflectionRunQuestion[]
+  insightMemoryIds: string[]
+  consumedSourceMemoryIds: string[]
+  createdAt: number
+  updatedAt: number
+  workspace?: string
+  completedAt?: number
 }
 
 export interface ExperienceMemory {
@@ -200,6 +232,82 @@ export function normalizeTombstone(value: unknown): MemoryTombstone {
     kind: value.kind,
     deletedAt: value.deletedAt,
     reasonCode: value.reasonCode,
+  }
+}
+
+/** Parse one persisted Reflection Run. */
+export function normalizeReflectionRun(value: unknown): ReflectionRun {
+  if (!isRecord(value)
+    || value.schemaVersion !== 'reflection-run@1'
+    || !isMemoryId(value.id)
+    || (value.status !== 'pending'
+      && value.status !== 'prepared'
+      && value.status !== 'completed')
+    || !Array.isArray(value.sourceMemories)
+    || !Array.isArray(value.questions)) {
+    invalid('invalid ExpMem reflection run')
+  }
+  const sourceMemories = value.sourceMemories.map(normalizeReflectionRunSource)
+  const questions = value.questions.map(normalizeReflectionRunQuestion)
+  const insightMemoryIds = ids(value.insightMemoryIds, 'reflection run insightMemoryIds')
+  const consumedSourceMemoryIds = ids(
+    value.consumedSourceMemoryIds,
+    'reflection run consumedSourceMemoryIds',
+  )
+  const createdAt = timestamp(value.createdAt, 'reflection run createdAt')
+  const updatedAt = timestamp(value.updatedAt, 'reflection run updatedAt')
+  const completedAt = optionalTimestamp(value.completedAt, 'reflection run completedAt')
+  if (new Set(sourceMemories.map(source => source.memoryId)).size !== sourceMemories.length) {
+    invalid('reflection run source memories must be unique')
+  }
+  if (new Set(questions.map(question => question.id)).size !== questions.length) {
+    invalid('reflection run question ids must be unique')
+  }
+  const sourceIds = new Set(sourceMemories.map(source => source.memoryId))
+  if (consumedSourceMemoryIds.some(id => !sourceIds.has(id))) {
+    invalid('reflection run consumed sources must belong to the run')
+  }
+  const totalImportance = sourceMemories.reduce(
+    (total, source) => total + source.importance,
+    0,
+  )
+  if (value.totalImportance !== totalImportance) {
+    invalid('reflection run totalImportance does not match its sources')
+  }
+  if (value.status === 'pending'
+    && (questions.length > 0
+      || insightMemoryIds.length > 0
+      || consumedSourceMemoryIds.length > 0
+      || completedAt !== undefined)) {
+    invalid('pending reflection run cannot contain prepared or completed output')
+  }
+  if (value.status === 'prepared'
+    && (questions.length === 0
+      || insightMemoryIds.length > 0
+      || consumedSourceMemoryIds.length > 0
+      || completedAt !== undefined)) {
+    invalid('prepared reflection run requires questions and no completed output')
+  }
+  if (value.status === 'completed'
+    && (questions.length === 0
+      || insightMemoryIds.length === 0
+      || consumedSourceMemoryIds.length === 0
+      || completedAt === undefined)) {
+    invalid('completed reflection run requires questions, insights, and consumed sources')
+  }
+  return {
+    schemaVersion: 'reflection-run@1',
+    id: value.id,
+    status: value.status,
+    sourceMemories,
+    totalImportance,
+    questions,
+    insightMemoryIds,
+    consumedSourceMemoryIds,
+    createdAt,
+    updatedAt,
+    ...optionalString(value.workspace, 'workspace'),
+    ...(completedAt === undefined ? {} : { completedAt }),
   }
 }
 
@@ -519,9 +627,39 @@ function normalizeVerification(value: unknown): MemoryVerification {
 
 function normalizeReflection(value: unknown): MemoryReflection {
   if (!isRecord(value)) invalid('invalid reflection')
+  const runId = value.runId === undefined ? undefined : memoryId(value.runId, 'reflection runId')
+  const questionId = value.questionId === undefined
+    ? undefined
+    : memoryId(value.questionId, 'reflection questionId')
+  if ((runId === undefined) !== (questionId === undefined)) {
+    invalid('reflection runId and questionId must both be present or absent')
+  }
   return {
     question: nonEmpty(value.question, 'reflection question'),
     sourceMemoryIds: ids(value.sourceMemoryIds, 'reflection sourceMemoryIds'),
+    ...(runId === undefined ? {} : { runId, questionId: questionId! }),
+  }
+}
+
+function normalizeReflectionRunSource(value: unknown): ReflectionRunSource {
+  if (!isRecord(value)) invalid('invalid reflection run source')
+  return {
+    memoryId: memoryId(value.memoryId, 'reflection run source memoryId'),
+    claimSha256: hash(value.claimSha256, 'reflection run source claimSha256'),
+    updatedAt: timestamp(value.updatedAt, 'reflection run source updatedAt'),
+    importance: importanceScore(value.importance),
+  }
+}
+
+function normalizeReflectionRunQuestion(value: unknown): ReflectionRunQuestion {
+  if (!isRecord(value)) invalid('invalid reflection run question')
+  return {
+    id: memoryId(value.id, 'reflection run question id'),
+    text: nonEmpty(value.text, 'reflection run question'),
+    retrievedMemoryIds: ids(
+      value.retrievedMemoryIds,
+      'reflection run retrievedMemoryIds',
+    ),
   }
 }
 
@@ -545,6 +683,11 @@ function isCompleteSessionEvidence(
 
 function isMemoryId(value: unknown): value is string {
   return typeof value === 'string' && UUID_V4.test(value)
+}
+
+function memoryId(value: unknown, name: string): string {
+  if (!isMemoryId(value)) invalid(`${name} must be a UUID`)
+  return value
 }
 
 function hash(value: unknown, name: string): string {

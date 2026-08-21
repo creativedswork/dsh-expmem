@@ -35,7 +35,7 @@ flowchart TB
 
   subgraph Cognition["Generative Agents-style cognitive loop"]
     Retrieve["Retrieve<br/>relevance + recency + importance"]
-    Reflect["Reflect<br/>insights with cited sources"]
+    Reflect["Reflection Run<br/>pending → prepared → completed"]
     Plan["Plan and act<br/>inside the DSH agent loop"]
   end
 
@@ -47,6 +47,8 @@ flowchart TB
   Retrieve --> Agent
   Agent -->|"promote durable experience"| Archive
   Agent --> Reflect
+  Reflect --> Retrieve
+  Retrieve --> Reflect
   Reflect --> Archive
   Agent --> Plan
 ```
@@ -64,7 +66,8 @@ Session events.
 - **Personalized retrieval:** search combines relevance, recency, and agent-assigned importance.
   Returned memories condition later planning and reactions.
 - **Auditable reflection:** higher-level insights cite the observations or earlier reflections
-  that support them. ExpMem rejects dangling links, self-links, and cycles.
+  that support them. Persistent Reflection Runs resume after interruption and consume only cited
+  source revisions.
 - **Trust lifecycle:** candidate, verified, disputed, and superseded states preserve provenance,
   conflicts, and replacement history. Confirmed deletion leaves a minimal tombstone.
 - **Local and lightweight:** ExpMem adds no vector database, background worker, or second model
@@ -146,11 +149,13 @@ $DSH_HOME/
 ├── sessions/                         # DSH-owned Recall JSONL
 └── expmem/
     ├── recall-index.sqlite           # derived DSH full-text index
-    └── archive/
-        ├── habit/<uuid>.json
-        ├── experience/<uuid>.json
-        ├── insight/<uuid>.json
-        └── tombstones/<uuid>.json
+    ├── archive/
+    │   ├── habit/<uuid>.json
+    │   ├── experience/<uuid>.json
+    │   ├── insight/<uuid>.json
+    │   └── tombstones/<uuid>.json
+    └── reflection-runs/
+        └── <uuid>.json
 ```
 
 Schema v1 records contain the claim, `candidate|verified|disputed|superseded` status, author,
@@ -196,10 +201,59 @@ An insight may include `reflection: { question, sourceMemoryIds }`. The source I
 auditable reflection tree and may point to observations or earlier reflections. A reflection
 with no ExpMem source must cite a complete DSH Session event range.
 
-After unreflected memories accumulate 30 importance points, ExpMem injects one reflection notice.
-The current agent formulates salient questions, retrieves related records, and writes up to three
-insight candidates. ExpMem makes no second model call. Active plans remain in DSH task and Session
-state rather than the long-term Archive.
+After unreflected memories accumulate 30 importance points, ExpMem creates a persistent
+Reflection Run:
+
+```text
+pending
+  → prepare high-level questions and retrieve evidence
+  → commit cited insight candidates
+  → completed
+```
+
+An interrupted run resumes on the next turn or after restart. Commit is idempotent, and a
+completed run consumes only the exact source revisions cited by its insights. Uncited records
+remain eligible for a later run. A source revision is bound to its claim SHA-256 and importance.
+ExpMem makes no second model call. Active plans remain in DSH task and Session state rather than
+the long-term Archive.
+
+The notice supplies the Run ID. The main agent first submits its questions:
+
+```json
+{
+  "action": "prepare",
+  "runId": "<run-uuid>",
+  "questions": [
+    "Which implementation practices have repeatedly improved review reliability?"
+  ]
+}
+```
+
+ExpMem returns a `questionId` and ranked memory hits for each question. The agent then commits
+one cited insight per question:
+
+```json
+{
+  "action": "commit",
+  "runId": "<run-uuid>",
+  "insights": [
+    {
+      "questionId": "<question-uuid>",
+      "title": "Evidence before conclusions",
+      "content": "Focused changes and explicit evidence improve review reliability.",
+      "importance": 8,
+      "sourceMemoryIds": ["<memory-uuid>"]
+    }
+  ]
+}
+```
+
+ExpMem accepts only memory IDs returned for that question. It writes each result as an `insight`
+candidate; completing a Run does not verify the claim.
+
+ExpMem identifies subagents through the durable Session header
+`origin: "subagent"`. Subagents do not receive Reflection Run notices, and `expmem_reflect`
+rejects calls from them. A normal fork with `parentSession` remains eligible.
 
 ## Tools
 
@@ -209,6 +263,7 @@ state rather than the long-term Archive.
 | `session_event_search` | Search events inside one prior session. |
 | `expmem_search` | Rank relevant experience by recency, importance, and relevance. |
 | `expmem_write` | Create or update a candidate, including importance and reflection provenance. |
+| `expmem_reflect` | Prepare or commit a persistent Reflection Run. |
 | `expmem_transition` | Verify or dispute a record with evidence; add conflicts or supersession. |
 | `expmem_forget` | Delete a candidate and leave a minimal tombstone. |
 

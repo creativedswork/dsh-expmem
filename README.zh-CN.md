@@ -33,7 +33,7 @@ flowchart TB
 
   subgraph Cognition["Generative Agents 风格的认知循环"]
     Retrieve["检索<br/>相关性 + 新近度 + 重要性"]
-    Reflect["反思<br/>带来源引用的洞见"]
+    Reflect["Reflection Run<br/>pending → prepared → completed"]
     Plan["规划与行动<br/>位于 DSH Agent Loop"]
   end
 
@@ -45,6 +45,8 @@ flowchart TB
   Retrieve --> Agent
   Agent -->|"晋升持久经验"| Archive
   Agent --> Reflect
+  Reflect --> Retrieve
+  Retrieve --> Reflect
   Reflect --> Archive
   Agent --> Plan
 ```
@@ -61,7 +63,8 @@ reflection 来源和可信记忆生命周期。它不会复制 Session 事件。
 - **个性化检索：** 搜索结合相关性、新近度和 Agent 指定的重要性，结果参与后续 planning
   和 reaction。
 - **可审计 reflection：** 高层洞见引用支撑它的观察或之前的 reflection。ExpMem 会拒绝
-  悬空引用、自引用和环路。
+  悬空引用、自引用和环路。持久化 Reflection Run 可以在中断后恢复，并且只消费实际引用的
+  来源 revision。
 - **可信生命周期：** candidate、verified、disputed 和 superseded 状态保留来源、冲突与
   替代历史；确认删除后只留下最小 tombstone。
 - **本地轻量：** 不引入向量数据库、后台 Worker 或第二次模型调用，也不修改 DSH Agent
@@ -141,11 +144,13 @@ $DSH_HOME/
 ├── sessions/                         # DSH 持有的 Recall JSONL
 └── expmem/
     ├── recall-index.sqlite           # DSH 派生的全文索引
-    └── archive/
-        ├── habit/<uuid>.json
-        ├── experience/<uuid>.json
-        ├── insight/<uuid>.json
-        └── tombstones/<uuid>.json
+    ├── archive/
+    │   ├── habit/<uuid>.json
+    │   ├── experience/<uuid>.json
+    │   ├── insight/<uuid>.json
+    │   └── tombstones/<uuid>.json
+    └── reflection-runs/
+        └── <uuid>.json
 ```
 
 Schema v1 记录包含 claim、`candidate|verified|disputed|superseded` 状态、作者、证据、
@@ -189,9 +194,58 @@ insight 可以包含 `reflection: { question, sourceMemoryIds }`。来源 ID 可
 之前的 reflection，从而形成可审计的 reflection tree。没有 ExpMem 来源记录时，reflection
 必须引用完整的 DSH Session 事件范围。
 
-未 reflection 的记忆累计达到 30 个 importance 点后，ExpMem 会注入一次 reflection
-notice。当前 Agent 负责提出关键问题、检索相关记录，并写入最多三条 insight candidate。
-这个过程不增加第二次模型调用。活动计划继续保存在 DSH 任务和 Session 状态中。
+未 reflection 的记忆累计达到 30 个 importance 点后，ExpMem 会创建一个持久化
+Reflection Run：
+
+```text
+pending
+  → 提交高层问题并检索证据
+  → 提交带引用的 insight candidate
+  → completed
+```
+
+Run 中断后会在下一 turn 或进程重启后恢复。commit 保持幂等，完成时只消费 insight
+实际引用的来源 revision；未引用记录仍可进入后续 Run。来源 revision 由 claim SHA-256
+和 importance 共同绑定。这个过程不增加第二次模型调用。活动计划继续保存在 DSH 任务和
+Session 状态中。
+
+notice 会提供 Run ID。主 Agent 先提交需要反思的问题：
+
+```json
+{
+  "action": "prepare",
+  "runId": "<run-uuid>",
+  "questions": [
+    "哪些实现方式反复提升了代码评审的可靠性？"
+  ]
+}
+```
+
+ExpMem 会为每个问题返回 `questionId` 和排序后的记忆结果。Agent 随后为每个问题提交一条
+带引用的 insight：
+
+```json
+{
+  "action": "commit",
+  "runId": "<run-uuid>",
+  "insights": [
+    {
+      "questionId": "<question-uuid>",
+      "title": "先提供证据，再给出结论",
+      "content": "聚焦的修改和明确证据能够提高代码评审的可靠性。",
+      "importance": 8,
+      "sourceMemoryIds": ["<memory-uuid>"]
+    }
+  ]
+}
+```
+
+`sourceMemoryIds` 只能引用该问题 prepare 结果中的记忆。ExpMem 会把结果写成 `insight`
+candidate；完成 Run 不等于验证 claim。
+
+ExpMem 通过持久化 Session Header 中的 `origin: "subagent"` 识别子 Agent。子 Agent
+不会收到 Reflection Run notice，调用 `expmem_reflect` 也会被拒绝。普通
+`parentSession` fork 仍可执行 Reflection Run。
 
 ## 工具
 
@@ -201,6 +255,7 @@ notice。当前 Agent 负责提出关键问题、检索相关记录，并写入�
 | `session_event_search` | 在指定历史会话内搜索事件。 |
 | `expmem_search` | 按新近度、重要性和相关性排序检索经验。 |
 | `expmem_write` | 创建或更新 candidate，并记录 importance 与 reflection 来源。 |
+| `expmem_reflect` | prepare 或 commit 一个持久化 Reflection Run。 |
 | `expmem_transition` | 用证据验证或质疑记录，并添加冲突或替代关系。 |
 | `expmem_forget` | 删除 candidate，并留下最小 tombstone。 |
 

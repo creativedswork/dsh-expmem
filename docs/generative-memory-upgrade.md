@@ -2,7 +2,8 @@
 
 ## Status
 
-Implemented in ExpMem 0.4.0.
+Retrieval and prompt-driven reflection shipped in ExpMem 0.4.0. Persistent
+Reflection Runs ship in ExpMem 0.5.0.
 
 ## Goal
 
@@ -60,6 +61,8 @@ defaults for existing records.
 interface MemoryReflection {
   question: string
   sourceMemoryIds: string[]
+  runId?: string
+  questionId?: string
 }
 
 interface ExperienceMemory {
@@ -67,6 +70,33 @@ interface ExperienceMemory {
   importance: number       // integer 1..10
   lastAccessedAt: number   // Unix epoch milliseconds
   reflection?: MemoryReflection
+}
+```
+
+Reflection Run state uses its own independently versioned contract:
+
+```ts
+interface ReflectionRun {
+  schemaVersion: 'reflection-run@1'
+  id: string
+  status: 'pending' | 'prepared' | 'completed'
+  sourceMemories: Array<{
+    memoryId: string
+    claimSha256: string
+    updatedAt: number
+    importance: number
+  }>
+  questions: Array<{
+    id: string
+    text: string
+    retrievedMemoryIds: string[]
+  }>
+  insightMemoryIds: string[]
+  consumedSourceMemoryIds: string[]
+  createdAt: number
+  updatedAt: number
+  completedAt?: number
+  workspace?: string
 }
 ```
 
@@ -145,24 +175,28 @@ The paper uses a threshold of 150 over a comprehensive observation stream.
 ExpMem stores a much smaller, already distilled Archive. Its default threshold
 is `30`.
 
-For the current workspace, ExpMem:
+For the current workspace, ExpMem collects non-reflection source revisions that
+no completed run has consumed and sums their importance. At the threshold it
+creates a persistent run:
 
-1. finds the newest reflection;
-2. collects later non-reflection records;
-3. sums their importance;
-4. injects one reflection notice when the sum reaches the configured threshold.
+1. `pending`: the current agent proposes one to three high-level questions;
+2. `prepared`: ExpMem retrieves and records ranked memory IDs for each question;
+3. `completed`: the agent submits cited insight candidates and ExpMem writes
+   them into the Archive.
 
-The notice includes recent record IDs, titles, statuses, and importance scores.
-It asks the current agent to:
+The run survives process restart. ExpMem repeats its notice on a later turn
+until the run completes, but suppresses duplicate notices within one turn.
+Commit retries return the same insight records.
 
-1. identify one to three high-level questions;
-2. use `expmem_search` for each question;
-3. write at most three `insight` candidates with reflection provenance;
-4. cite a complete Session event range when the source exists only in Recall.
+Only the main agent may own this workflow. A session with
+`header.origin === 'subagent'` receives no Reflection Run notice, and the tool
+rejects prepare or commit calls from that session. `parentSession` alone does
+not identify a subagent because ordinary forks also carry that field.
 
-The plugin remembers the source-record fingerprint per Session. It does not
-repeat the notice until the source set changes. Writing a reflection advances
-the reflection watermark.
+Completion consumes only source revisions cited by committed insights. An
+uncited source remains eligible for a later run, and updating a consumed record
+creates a new eligible revision. Older reflections without Run metadata retain
+their existing source-consumption behavior.
 
 Pressure promotion retains priority. When context pressure and reflection
 pressure occur on the same step, the plugin emits the context-preservation
@@ -190,8 +224,12 @@ interface Config {
 `expmem_search` changes from strict AND ordering by update time to ranked
 retrieval. Existing filters and cursor pagination remain.
 
-No new tool is needed. The existing write tool records observations and
-reflections, and the existing search tool retrieves both.
+`expmem_reflect` has two actions:
+
+- `prepare` accepts a Run ID and high-level questions, performs ranked
+  retrieval, and persists the retrieved memory IDs;
+- `commit` accepts cited insights, validates every citation against its
+  prepared question, writes insight candidates, and completes the Run.
 
 ## Explicit boundaries
 
@@ -216,7 +254,9 @@ validates, stores, ranks, and schedules.
 - Reflection records reject missing provenance, dangling sources, self-links,
   and cycles.
 - Recursive reflections can cite earlier reflections.
-- Reflection pressure fires once for an unchanged source set and resets after a
-  new reflection.
+- A pending or prepared Run resumes after process restart.
+- Repeated commit is idempotent.
+- Only cited source revisions are consumed.
+- Uncited and subsequently updated records remain eligible.
 - Context pressure still takes priority.
 - No runtime dependency or extra model request is added.

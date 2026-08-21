@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import {
   mkdir,
   readFile,
@@ -16,6 +16,7 @@ import {
   isMemoryStatus,
   normalizeEvidenceInput,
   normalizeMemory,
+  normalizeReflectionRun,
   normalizeTombstone,
   normalizeVerificationInput,
   type DeletionReasonCode,
@@ -30,6 +31,8 @@ import {
   type MemoryTombstone,
   type MemoryVerification,
   type MemoryVerificationInput,
+  type ReflectionRun,
+  type ReflectionRunQuestion,
 } from './schema.js'
 
 export type {
@@ -45,6 +48,10 @@ export type {
   MemoryTombstone,
   MemoryVerification,
   MemoryVerificationInput,
+  ReflectionRun,
+  ReflectionRunQuestion,
+  ReflectionRunSource,
+  ReflectionRunStatus,
 } from './schema.js'
 
 /** One Archive search result. */
@@ -154,6 +161,7 @@ export interface ReflectionPressureRecord {
   kind: ExperienceKind
   title: string
   status: MemoryStatus
+  claimSha256: string
   importance: number
   updatedAt: number
 }
@@ -161,8 +169,32 @@ export interface ReflectionPressureRecord {
 export interface ReflectionPressure {
   totalImportance: number
   fingerprint: string
-  latestReflectionAt?: number
   records: ReflectionPressureRecord[]
+}
+
+export interface ReflectionInsightInput {
+  questionId: string
+  title: string
+  content: string
+  importance: number
+  sourceMemoryIds: string[]
+  tags?: string[]
+}
+
+export interface ReflectionPreparation {
+  run: ReflectionRun
+  questions: Array<ReflectionRunQuestion & { hits: ExperienceSearchHit[] }>
+}
+
+export interface ReflectionPrepareOptions {
+  maxQuestions: number
+  maxSearchResults: number
+  recencyDecay: number
+}
+
+export interface ReflectionCommitResult {
+  run: ReflectionRun
+  insights: ExperienceMemory[]
 }
 
 interface LoadedArchive extends ArchiveScanResult {
@@ -534,41 +566,268 @@ export class FileExperienceArchive {
     }
   }
 
-  /** Summarize unreflected importance for one workspace. */
+  /** Summarize source revisions not consumed by a completed Reflection Run. */
   async reflectionPressure(workspace?: string): Promise<ReflectionPressure> {
     const loaded = await this.loadArchive()
     const memories = resolveArchive(loaded.memories).memories.filter(memory =>
       memory.status !== 'superseded'
       && (workspace === undefined || memory.workspace === workspace))
-    const latestReflectionAt = memories.reduce<number | undefined>(
-      (latest, memory) => memory.reflection === undefined
-        ? latest
-        : Math.max(latest ?? 0, memory.createdAt),
-      undefined,
-    )
+    const byId = new Map(memories.map(memory => [memory.id, memory]))
+    const consumed = new Set<string>()
+    for (const run of await this.loadReflectionRuns()) {
+      if (run.status !== 'completed') continue
+      const consumedIds = new Set(run.consumedSourceMemoryIds)
+      for (const source of run.sourceMemories) {
+        if (consumedIds.has(source.memoryId)) consumed.add(reflectionRevision(source))
+      }
+    }
+    for (const reflection of memories.filter(memory =>
+      memory.reflection !== undefined && memory.reflection.runId === undefined)) {
+      for (const sourceId of reflection.reflection!.sourceMemoryIds) {
+        const source = byId.get(sourceId)
+        if (source !== undefined && source.updatedAt <= reflection.createdAt) {
+          consumed.add(reflectionRevision({
+            memoryId: source.id,
+            claimSha256: claimSha256(source),
+            importance: source.importance,
+          }))
+        }
+      }
+    }
     const records = memories
       .filter(memory =>
         memory.reflection === undefined
-        && (latestReflectionAt === undefined || memory.updatedAt > latestReflectionAt))
+        && !consumed.has(reflectionRevision({
+          memoryId: memory.id,
+          claimSha256: claimSha256(memory),
+          importance: memory.importance,
+        })))
       .map(memory => ({
         id: memory.id,
         kind: memory.kind,
         title: memory.title,
         status: memory.status,
+        claimSha256: claimSha256(memory),
         importance: memory.importance,
         updatedAt: memory.updatedAt,
       }))
       .sort((left, right) => right.updatedAt - left.updatedAt || left.id.localeCompare(right.id))
     const fingerprint = [...records]
       .sort((left, right) => left.id.localeCompare(right.id))
-      .map(record => `${record.id}:${record.updatedAt}:${record.importance}`)
+      .map(record => `${record.id}:${record.claimSha256}:${record.importance}`)
       .join('|')
     return {
       totalImportance: records.reduce((total, record) => total + record.importance, 0),
       fingerprint,
-      ...(latestReflectionAt === undefined ? {} : { latestReflectionAt }),
       records,
     }
+  }
+
+  /** Return an unfinished run or create one when unreflected importance reaches the threshold. */
+  async ensureReflectionRun(
+    workspace: string | undefined,
+    threshold: number,
+  ): Promise<ReflectionRun | undefined> {
+    if (!Number.isSafeInteger(threshold) || threshold < 1) {
+      throw new Error('reflection threshold must be a positive safe integer')
+    }
+    const open = (await this.loadReflectionRuns())
+      .filter(run => run.status !== 'completed' && run.workspace === workspace)
+      .sort((left, right) => left.createdAt - right.createdAt)[0]
+    if (open !== undefined) return open
+
+    const pressure = await this.reflectionPressure(workspace)
+    if (pressure.totalImportance < threshold || pressure.records.length === 0) return undefined
+    const sourceMemories = pressure.records
+      .map(record => ({
+        memoryId: record.id,
+        claimSha256: record.claimSha256,
+        updatedAt: record.updatedAt,
+        importance: record.importance,
+      }))
+      .sort((left, right) => left.memoryId.localeCompare(right.memoryId))
+    const id = stableUuid(`reflection-run:${workspace ?? ''}:${pressure.fingerprint}`)
+    const existing = await this.readReflectionRunFile(id, false)
+    if (existing !== undefined) return existing
+    const now = Date.now()
+    const run = normalizeReflectionRun({
+      schemaVersion: 'reflection-run@1',
+      id,
+      status: 'pending',
+      sourceMemories,
+      totalImportance: pressure.totalImportance,
+      questions: [],
+      insightMemoryIds: [],
+      consumedSourceMemoryIds: [],
+      createdAt: now,
+      updatedAt: now,
+      ...(workspace === undefined ? {} : { workspace }),
+    })
+    await atomicJsonWrite(this.reflectionRunPath(run.id), run)
+    return run
+  }
+
+  /** Retrieve ranked evidence for the questions proposed by the current agent. */
+  async prepareReflectionRun(
+    id: string,
+    questions: string[],
+    options: ReflectionPrepareOptions,
+  ): Promise<ReflectionPreparation> {
+    assertMemoryId(id)
+    const run = await this.readReflectionRun(id)
+    if (run.status === 'completed') throw new Error(`ExpMem reflection run is completed: ${id}`)
+    if (questions.length < 1 || questions.length > options.maxQuestions) {
+      throw new Error(`reflection questions must contain 1 to ${options.maxQuestions} items`)
+    }
+    const texts = questions.map(question => requiredText(question, 'reflection question'))
+    if (new Set(texts).size !== texts.length) {
+      throw new Error('reflection questions must be unique')
+    }
+    if (run.status === 'prepared'
+      && JSON.stringify(texts) !== JSON.stringify(run.questions.map(question => question.text))) {
+      const partial = (await this.loadArchive()).memories.some(memory =>
+        memory.reflection?.runId === run.id)
+      if (partial) {
+        throw new Error('reflection run with partial output cannot replace its questions')
+      }
+    }
+
+    const preparedQuestions: ReflectionPreparation['questions'] = []
+    for (const text of texts) {
+      const page = await this.search({
+        query: text,
+        limit: options.maxSearchResults,
+        recencyDecay: options.recencyDecay,
+        ...(run.workspace === undefined ? {} : { workspace: run.workspace }),
+      })
+      const question = {
+        id: stableUuid(`reflection-question:${run.id}:${text}`),
+        text,
+        retrievedMemoryIds: page.hits.map(hit => hit.id),
+      }
+      preparedQuestions.push({ ...question, hits: page.hits })
+    }
+    const updated = normalizeReflectionRun({
+      ...run,
+      status: 'prepared',
+      questions: preparedQuestions.map(({ hits: _hits, ...question }) => question),
+      updatedAt: Date.now(),
+    })
+    await atomicJsonWrite(this.reflectionRunPath(updated.id), updated)
+    return { run: updated, questions: preparedQuestions }
+  }
+
+  /** Write cited insight candidates and complete one prepared Reflection Run. */
+  async commitReflectionRun(
+    id: string,
+    inputs: ReflectionInsightInput[],
+    source: ExperienceSource,
+    maxInsights: number,
+  ): Promise<ReflectionCommitResult> {
+    assertMemoryId(id)
+    const run = await this.readReflectionRun(id)
+    if (run.status === 'completed') {
+      return { run, insights: await this.reflectionRunInsights(run) }
+    }
+    if (run.status !== 'prepared') {
+      throw new Error(`ExpMem reflection run must be prepared before commit: ${id}`)
+    }
+    if (inputs.length < 1 || inputs.length > maxInsights) {
+      throw new Error(`reflection insights must contain 1 to ${maxInsights} items`)
+    }
+
+    const questions = new Map(run.questions.map(question => [question.id, question]))
+    const normalized = inputs.map(input => {
+      assertMemoryId(input.questionId)
+      const question = questions.get(input.questionId)
+      if (question === undefined) {
+        throw new Error(`reflection question does not belong to run: ${input.questionId}`)
+      }
+      const sourceMemoryIds = uniqueMemoryIds(
+        input.sourceMemoryIds,
+        'reflection sourceMemoryIds',
+      )
+      if (sourceMemoryIds.length === 0) {
+        throw new Error('reflection insight requires at least one source memory')
+      }
+      const retrieved = new Set(question.retrievedMemoryIds)
+      const outside = sourceMemoryIds.find(sourceId => !retrieved.has(sourceId))
+      if (outside !== undefined) {
+        throw new Error(`reflection source was not retrieved for its question: ${outside}`)
+      }
+      const content = requiredText(input.content, 'reflection content')
+      if (content.length > this.limits.maxEntryChars) {
+        throw new Error(`ExpMem content exceeds maxEntryChars (${this.limits.maxEntryChars})`)
+      }
+      return {
+        ...input,
+        title: requiredText(input.title, 'reflection title'),
+        content,
+        importance: requiredImportance(input.importance),
+        tags: normalizedTags(input.tags ?? []).sort(),
+        sourceMemoryIds,
+        question,
+      }
+    })
+    if (new Set(normalized.map(input => input.questionId)).size !== normalized.length) {
+      throw new Error('reflection run accepts at most one insight per question')
+    }
+    const runSourceIds = new Set(run.sourceMemories.map(record => record.memoryId))
+    const consumedSourceMemoryIds = [...new Set(
+      normalized.flatMap(input => input.sourceMemoryIds).filter(id => runSourceIds.has(id)),
+    )].sort()
+    if (consumedSourceMemoryIds.length === 0) {
+      throw new Error('reflection run must cite at least one source that triggered the run')
+    }
+
+    const loaded = await this.loadArchive()
+    const insights: ExperienceMemory[] = []
+    for (const input of normalized) {
+      const existing = loaded.memories.filter(memory =>
+        memory.reflection?.runId === run.id
+        && memory.reflection.questionId === input.questionId)
+      if (existing.length > 1) {
+        throw new Error(`multiple reflection insights exist for question: ${input.questionId}`)
+      }
+      if (existing[0] !== undefined) {
+        assertMatchingReflection(existing[0], input)
+        insights.push(existing[0])
+        continue
+      }
+      insights.push(await this.writeCandidate({
+        kind: 'insight',
+        title: input.title,
+        content: input.content,
+        importance: input.importance,
+        tags: input.tags,
+        reflection: {
+          question: input.question.text,
+          sourceMemoryIds: input.sourceMemoryIds,
+          runId: run.id,
+          questionId: input.questionId,
+        },
+      }, source))
+    }
+
+    const now = Date.now()
+    const completed = normalizeReflectionRun({
+      ...run,
+      status: 'completed',
+      insightMemoryIds: insights.map(insight => insight.id),
+      consumedSourceMemoryIds,
+      updatedAt: now,
+      completedAt: now,
+    })
+    await atomicJsonWrite(this.reflectionRunPath(completed.id), completed)
+    return { run: completed, insights }
+  }
+
+  /** Read one exact Reflection Run. */
+  async readReflectionRun(id: string): Promise<ReflectionRun> {
+    assertMemoryId(id)
+    const run = await this.readReflectionRunFile(id, true)
+    if (run === undefined) throw new Error(`ExpMem reflection run not found: ${id}`)
+    return run
   }
 
   private async validateReflection(
@@ -605,6 +864,58 @@ export class FileExperienceArchive {
         ...memory,
         lastAccessedAt: accessedAt,
       }))
+    }
+  }
+
+  private async reflectionRunInsights(run: ReflectionRun): Promise<ExperienceMemory[]> {
+    const byId = new Map((await this.loadArchive()).memories.map(memory => [memory.id, memory]))
+    return run.insightMemoryIds.flatMap(id => {
+      const memory = byId.get(id)
+      return memory === undefined ? [] : [memory]
+    })
+  }
+
+  private async loadReflectionRuns(): Promise<ReflectionRun[]> {
+    const runs: ReflectionRun[] = []
+    const directory = join(this.rootDir, 'reflection-runs')
+    for (const name of await jsonFiles(directory)) {
+      const path = join(directory, name)
+      let run: ReflectionRun
+      try {
+        run = normalizeReflectionRun(await readJson(path))
+      } catch (error) {
+        throw contextualError(path, this.rootDir, error)
+      }
+      if (run.id !== basename(name, '.json')) {
+        throw contextualError(
+          path,
+          this.rootDir,
+          new MemorySchemaError(
+            'reflection run path does not match id',
+            'invalid-record',
+          ),
+        )
+      }
+      runs.push(run)
+    }
+    return runs
+  }
+
+  private async readReflectionRunFile(
+    id: string,
+    required: boolean,
+  ): Promise<ReflectionRun | undefined> {
+    const path = this.reflectionRunPath(id)
+    try {
+      const run = normalizeReflectionRun(await readJson(path))
+      if (run.id !== id) throw new Error('reflection run path does not match id')
+      return run
+    } catch (error) {
+      if (isNodeError(error, 'ENOENT') && !required) return undefined
+      if (isNodeError(error, 'ENOENT')) {
+        throw new Error(`ExpMem reflection run not found: ${id}`)
+      }
+      throw contextualError(path, this.rootDir, error)
     }
   }
 
@@ -685,6 +996,10 @@ export class FileExperienceArchive {
 
   private tombstonePath(id: string): string {
     return join(this.rootDir, 'archive', 'tombstones', `${id}.json`)
+  }
+
+  private reflectionRunPath(id: string): string {
+    return join(this.rootDir, 'reflection-runs', `${id}.json`)
   }
 }
 
@@ -887,6 +1202,47 @@ function normalizeScores(values: number[]): number[] {
 
 function roundedScore(value: number): number {
   return Math.round(value * 1_000_000) / 1_000_000
+}
+
+function reflectionRevision(source: Pick<ReflectionRun['sourceMemories'][number],
+  'memoryId' | 'claimSha256' | 'importance'>): string {
+  return `${source.memoryId}:${source.claimSha256}:${source.importance}`
+}
+
+function uniqueMemoryIds(values: string[], name: string): string[] {
+  for (const value of values) assertMemoryId(value)
+  if (new Set(values).size !== values.length) throw new Error(`${name} must be unique`)
+  return [...values].sort()
+}
+
+function stableUuid(seed: string): string {
+  const value = createHash('sha256').update(seed).digest('hex').slice(0, 32).split('')
+  value[12] = '4'
+  value[16] = ['8', '9', 'a', 'b'][Number.parseInt(value[16]!, 16) % 4]!
+  return `${value.slice(0, 8).join('')}-${value.slice(8, 12).join('')}-${value.slice(12, 16).join('')}-${value.slice(16, 20).join('')}-${value.slice(20).join('')}`
+}
+
+function assertMatchingReflection(
+  memory: ExperienceMemory,
+  input: ReflectionInsightInput & { question: ReflectionRunQuestion },
+): void {
+  const reflection = memory.reflection
+  if (memory.kind !== 'insight'
+    || memory.title !== input.title
+    || memory.content !== input.content
+    || memory.importance !== input.importance
+    || JSON.stringify(memory.tags) !== JSON.stringify(input.tags ?? [])
+    || reflection?.question !== input.question.text
+    || JSON.stringify(reflection.sourceMemoryIds) !== JSON.stringify(input.sourceMemoryIds)) {
+    throw new Error(`reflection insight already exists with different content: ${input.questionId}`)
+  }
+}
+
+function requiredImportance(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 1 || value > 10) {
+    throw new Error('reflection importance must be an integer from 1 to 10')
+  }
+  return value
 }
 
 function requiredText(value: string, name: string): string {

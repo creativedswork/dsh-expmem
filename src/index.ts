@@ -26,7 +26,8 @@ import {
   type MemoryEvidenceInput,
   type MemoryReflection,
   type MemoryVerificationInput,
-  type ReflectionPressure,
+  type ReflectionInsightInput,
+  type ReflectionRun,
 } from './storage.js'
 
 export type {
@@ -51,8 +52,16 @@ export type {
   MemoryTombstone,
   MemoryVerification,
   MemoryVerificationInput,
+  ReflectionCommitResult,
+  ReflectionInsightInput,
+  ReflectionPreparation,
+  ReflectionPrepareOptions,
   ReflectionPressure,
   ReflectionPressureRecord,
+  ReflectionRun,
+  ReflectionRunQuestion,
+  ReflectionRunSource,
+  ReflectionRunStatus,
 } from './storage.js'
 export { FileExperienceArchive } from './storage.js'
 export { claimSha256, MemorySchemaError } from './schema.js'
@@ -150,6 +159,7 @@ const EXPMEM_PROMPT =
   + 'Use expmem_search for distilled user habits, task experience, and reusable insights. '
   + 'Use expmem_write for stable candidate knowledge; update an existing candidate instead of duplicating it. '
   + 'Assign importance from 1 to 10, and record higher-level insight reflections with cited source memory IDs. '
+  + 'Only the main agent may complete pending Reflection Runs with expmem_reflect. '
   + 'Use ranked ExpMem results to personalize planning and reactions. '
   + 'Treat candidate and disputed memory as unverified, and use expmem_transition only with cited evidence. '
   + 'A review report is useful provenance but cannot verify a claim by itself. '
@@ -181,6 +191,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   })
   ctx.tools.register(searchTool(archive, resolved))
   ctx.tools.register(writeTool(archive))
+  ctx.tools.register(reflectionTool(archive, resolved))
   ctx.tools.register(transitionTool(archive))
   ctx.tools.register(forgetTool(archive))
 
@@ -205,7 +216,10 @@ interface PromotionState {
   warnedSinceCompaction: boolean
   pendingRecovery?: PendingRecovery
   summaries: Map<string, PendingRecovery>
-  lastReflectionFingerprint?: string
+  lastReflectionNotice?: {
+    runId: string
+    turn: number
+  }
 }
 
 function registerMemoryNotices(
@@ -216,7 +230,7 @@ function registerMemoryNotices(
   const states = new WeakMap<Session, PromotionState>()
 
   ctx.on('agent/pre-step', async (
-    { agent, signal },
+    { agent, signal, turn },
     next,
   ): Promise<PreStepDecision> => {
     const before = syncPromotionState(states, agent.session)
@@ -250,15 +264,16 @@ function registerMemoryNotices(
         pressureMessage(ratio, config.maxPromotionsPerCycle),
       )
     }
-    if (!config.reflectionEnabled) return decision
-    const reflection = await archive.reflectionPressure(agent.session.header.cwd)
+    if (!config.reflectionEnabled || agent.session.header.origin === 'subagent') return decision
+    const reflection = await archive.ensureReflectionRun(
+      agent.session.header.cwd,
+      config.reflectionThreshold,
+    )
     signal.throwIfAborted()
-    if (
-      reflection.totalImportance < config.reflectionThreshold
-      || reflection.fingerprint.length === 0
-      || after.lastReflectionFingerprint === reflection.fingerprint
-    ) return decision
-    after.lastReflectionFingerprint = reflection.fingerprint
+    if (reflection === undefined
+      || (after.lastReflectionNotice?.runId === reflection.id
+        && after.lastReflectionNotice.turn === turn)) return decision
+    after.lastReflectionNotice = { runId: reflection.id, turn }
     return appendPromotionNotice(
       decision,
       reflectionMessage(reflection, config.maxPromotionsPerCycle),
@@ -316,21 +331,33 @@ function recoveryMessage(agent: Agent, recovery: PendingRecovery, maxPromotions:
   })
 }
 
-function reflectionMessage(reflection: ReflectionPressure, maxReflections: number) {
-  const records = reflection.records
+function reflectionMessage(reflection: ReflectionRun, maxReflections: number) {
+  const records = reflection.sourceMemories
     .slice(0, 10)
-    .map(record =>
-      `- ${record.id} | ${record.status} | importance ${record.importance} | ${record.title}`)
+    .map(record => `- ${record.memoryId} | importance ${record.importance}`)
+  const next = reflection.status === 'pending'
+    ? [
+        `1. Identify one to ${maxReflections} high-level questions about recurring preferences, effective approaches, or engineering judgment.`,
+        `2. Call expmem_reflect with action "prepare", runId "${reflection.id}", and those questions.`,
+        '3. Review the ranked evidence returned for each question.',
+        `4. Call expmem_reflect with action "commit" and at most ${maxReflections} cited insight candidates.`,
+      ]
+    : [
+        'This run already has prepared questions:',
+        ...reflection.questions.map(question =>
+          `- ${question.id} | ${question.text} | ${question.retrievedMemoryIds.length} retrieved memories`),
+        '1. Review the prepared evidence; use expmem_search again if the earlier tool result is no longer visible.',
+        `2. Call expmem_reflect with action "commit", runId "${reflection.id}", and at most ${maxReflections} cited insight candidates.`,
+      ]
   const text = [
-    `ExpMem reflection pressure: ${reflection.totalImportance} importance points accumulated.`,
-    'Recent unreflected memories:',
+    `ExpMem Reflection Run ${reflection.id} is ${reflection.status}.`,
+    `${reflection.totalImportance} importance points triggered this run.`,
+    'Unconsumed source revisions:',
     ...records,
     'Before continuing the original task:',
-    '1. Identify one to three high-level questions about recurring preferences, effective approaches, or engineering judgment.',
-    '2. Use expmem_search for each question and inspect the returned status and evidence.',
-    `3. Write at most ${maxReflections} insight candidates with importance and reflection { question, sourceMemoryIds }.`,
-    '4. Cite a complete Session event range when the source exists only in Recall.',
-    '5. Keep conclusions bounded by their sources. Reflection does not imply verification.',
+    ...next,
+    'Only source revisions cited by committed insights are consumed.',
+    'Keep conclusions bounded by their sources. Reflection does not imply verification.',
   ].join('\n')
   return createUserMessage({
     content: [{ type: 'text', text }],
@@ -656,6 +683,89 @@ function writeTool(archive: FileExperienceArchive): ToolDefinition {
   })
 }
 
+function reflectionTool(
+  archive: FileExperienceArchive,
+  config: ResolvedConfig,
+): ToolDefinition {
+  return defineTool({
+    name: 'expmem_reflect',
+    description:
+      'Prepare or commit one persistent Reflection Run as the main agent. Prepare retrieves ranked evidence for high-level questions; commit writes cited insight candidates.',
+    parameters: {
+      action: {
+        type: 'string',
+        enum: ['prepare', 'commit'],
+        required: true,
+      },
+      runId: {
+        type: 'string',
+        required: true,
+        description: 'Reflection Run UUID from the ExpMem notice.',
+      },
+      questions: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'One to three high-level questions. Required for prepare.',
+      },
+      insights: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            questionId: {
+              type: 'string',
+              required: true,
+              description: 'Question UUID returned by prepare.',
+            },
+            title: { type: 'string', required: true },
+            content: { type: 'string', required: true },
+            importance: {
+              type: 'integer',
+              enum: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+              required: true,
+            },
+            sourceMemoryIds: {
+              type: 'array',
+              items: { type: 'string' },
+              required: true,
+              description: 'Memory UUIDs returned for this question by prepare.',
+            },
+            tags: {
+              type: 'array',
+              items: { type: 'string' },
+            },
+          },
+        },
+        description: 'One cited insight per prepared question. Required for commit.',
+      },
+    },
+    output: JSON_OUTPUT,
+    async execute(args, exec) {
+      assertMainAgent(exec)
+      if (args.action === 'prepare') {
+        if (args.questions === undefined || args.insights !== undefined) {
+          throw new Error('expmem_reflect prepare requires questions and no insights')
+        }
+        return await archive.prepareReflectionRun(args.runId, args.questions, {
+          maxQuestions: config.maxPromotionsPerCycle,
+          maxSearchResults: config.maxSearchResults,
+          recencyDecay: config.recencyDecay,
+        }) as unknown as JsonValue
+      }
+      if (args.insights === undefined || args.questions !== undefined) {
+        throw new Error('expmem_reflect commit requires insights and no questions')
+      }
+      return await archive.commitReflectionRun(
+        args.runId,
+        args.insights as ReflectionInsightInput[],
+        sourceOf(exec),
+        config.maxPromotionsPerCycle,
+      ) as unknown as JsonValue
+    },
+  })
+}
+
 function transitionTool(archive: FileExperienceArchive): ToolDefinition {
   return defineTool({
     name: 'expmem_transition',
@@ -819,5 +929,11 @@ function sourceOf(exec: ToolRunContext): ExperienceSource {
     ...session === undefined ? {} : { sessionId: String(session.id) },
     ...session?.header.cwd === undefined ? {} : { workspace: session.header.cwd },
     ...actorId === undefined ? {} : { actor: { kind: 'agent', id: String(actorId) } },
+  }
+}
+
+function assertMainAgent(exec: ToolRunContext): void {
+  if (exec.agent?.session.header.origin === 'subagent') {
+    throw new Error('expmem_reflect is restricted to the main agent')
   }
 }

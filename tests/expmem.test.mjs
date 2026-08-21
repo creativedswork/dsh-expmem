@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -43,6 +43,7 @@ test('provides file-backed experience memory over native DSH Recall', async () =
 
     assert.deepEqual([...definitions.keys()].sort(), [
       'expmem_forget',
+      'expmem_reflect',
       'expmem_search',
       'expmem_transition',
       'expmem_write',
@@ -216,7 +217,7 @@ test('promotes once per compaction cycle and recovers threshold jumps from Recal
   }
 })
 
-test('requests one reflection per unchanged importance set and resets after reflection', async () => {
+test('runs persistent reflection preparation and consumes only cited sources', async () => {
   const rootDir = await mkdtemp(join(tmpdir(), 'dsh-expmem-reflection-notice-'))
   const definitions = new Map()
   const ctx = new Context()
@@ -234,7 +235,7 @@ test('requests one reflection per unchanged importance set and resets after refl
       promotionEnabled: false,
       reflectionThreshold: 10,
     })
-    const session = fakeSession('reflection-session')
+    const session = fakeSession('reflection-session', { parentSession: 'fork-source' })
     const agent = {
       id: session.id,
       options: {},
@@ -256,32 +257,105 @@ test('requests one reflection per unchanged importance set and resets after refl
       content: 'The user asks for evidence before conclusions.',
       importance: 5,
     }, exec)
-    const dispatch = () => ctx.waterfall('agent/pre-step', {
+    const dispatch = (turn) => ctx.waterfall('agent/pre-step', {
       agent,
+      messages: [],
+      turn,
+      step: 1,
+      signal: new AbortController().signal,
+    }, () => Promise.resolve({ kind: 'enter', messages: [] }))
+
+    const childSession = fakeSession('reflection-child', {
+      origin: 'subagent',
+      parentSession: session.id,
+    })
+    const childAgent = { id: childSession.id, options: {}, session: childSession }
+    const childDecision = await ctx.waterfall('agent/pre-step', {
+      agent: childAgent,
       messages: [],
       turn: 1,
       step: 1,
       signal: new AbortController().signal,
     }, () => Promise.resolve({ kind: 'enter', messages: [] }))
+    assert.equal(childDecision.messages.length, 0)
+    await assert.rejects(readdir(join(rootDir, 'reflection-runs')), { code: 'ENOENT' })
 
-    const notice = (await dispatch()).messages[0]
+    const notice = (await dispatch(1)).messages[0]
     assert.equal(notice.source.summary, 'ExpMem reflection pressure')
     assert.match(notice.content[0].text, /11 importance points/)
     assert.match(notice.content[0].text, new RegExp(first.id))
-    assert.match(notice.content[0].text, /sourceMemoryIds/)
-    assert.equal((await dispatch()).messages.length, 0)
+    assert.match(notice.content[0].text, /expmem_reflect/)
+    const runId = notice.content[0].text.match(
+      /Reflection Run ([0-9a-f-]{36})/,
+    )[1]
+    await assert.rejects(definitions.get('expmem_reflect').execute({
+      action: 'prepare',
+      runId,
+      questions: ['Which practices work?'],
+    }, {
+      signal: new AbortController().signal,
+      agent: childAgent,
+    }), /restricted to the main agent/)
+    assert.equal((await dispatch(1)).messages.length, 0)
+    const resumedNotice = (await dispatch(2)).messages[0]
+    assert.match(resumedNotice.content[0].text, new RegExp(runId))
 
-    await definitions.get('expmem_write').execute({
-      kind: 'insight',
-      title: 'Evidence-oriented collaboration',
-      content: 'Focused changes and evidence improve collaboration reliability.',
-      importance: 8,
-      reflection: {
-        question: 'Which collaboration approach repeatedly works?',
-        sourceMemoryIds: [first.id, second.id],
-      },
+    const prepared = await definitions.get('expmem_reflect').execute({
+      action: 'prepare',
+      runId,
+      questions: ['Which focused and evidence-based collaboration approach works?'],
     }, exec)
-    assert.equal((await dispatch()).messages.length, 0)
+    assert.equal(prepared.run.status, 'prepared')
+    assert.deepEqual(
+      new Set(prepared.questions[0].hits.map(hit => hit.id)),
+      new Set([first.id, second.id]),
+    )
+    const questionId = prepared.questions[0].id
+    const committed = await definitions.get('expmem_reflect').execute({
+      action: 'commit',
+      runId,
+      insights: [{
+        questionId,
+        title: 'Evidence-oriented collaboration',
+        content: 'Focused changes and evidence improve collaboration reliability.',
+        importance: 8,
+        sourceMemoryIds: [first.id],
+      }],
+    }, exec)
+    assert.equal(committed.run.status, 'completed')
+    assert.deepEqual(committed.run.consumedSourceMemoryIds, [first.id])
+    assert.equal(committed.insights[0].reflection.runId, runId)
+    assert.equal(committed.insights[0].reflection.questionId, questionId)
+
+    const retried = await definitions.get('expmem_reflect').execute({
+      action: 'commit',
+      runId,
+      insights: [{
+        questionId,
+        title: 'Evidence-oriented collaboration',
+        content: 'Focused changes and evidence improve collaboration reliability.',
+        importance: 8,
+        sourceMemoryIds: [first.id],
+      }],
+    }, exec)
+    assert.equal(retried.insights[0].id, committed.insights[0].id)
+    assert.equal((await dispatch(3)).messages.length, 0)
+
+    const third = await definitions.get('expmem_write').execute({
+      kind: 'experience',
+      title: 'A second focused result',
+      content: 'Another focused change passed review.',
+      importance: 5,
+    }, exec)
+    const nextNotice = (await dispatch(4)).messages[0]
+    assert.match(nextNotice.content[0].text, new RegExp(second.id))
+    assert.match(nextNotice.content[0].text, new RegExp(third.id))
+    assert.doesNotMatch(nextNotice.content[0].text, new RegExp(first.id))
+    assert.match(nextNotice.content[0].text, /10 importance points/)
+    assert.notEqual(
+      nextNotice.content[0].text.match(/Reflection Run ([0-9a-f-]{36})/)[1],
+      runId,
+    )
   } finally {
     await ctx.fiber.dispose()
     await rm(rootDir, { recursive: true, force: true })
@@ -338,10 +412,10 @@ test('prioritizes context preservation when reflection pressure is also ready', 
   }
 })
 
-function fakeSession(id) {
+function fakeSession(id, header = {}) {
   return {
     id,
-    header: { cwd: '/workspace/project' },
+    header: { cwd: '/workspace/project', ...header },
     events: [],
     requestHeader: () => ({ config: { provider: 'mock', model: 'mock' } }),
   }

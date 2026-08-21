@@ -67,6 +67,9 @@ try {
   assert.match(declarations, /MemoryTombstone/)
   assert.match(declarations, /MemoryReflection/)
   assert.match(declarations, /ReflectionPressure/)
+  assert.match(declarations, /ReflectionRun/)
+  assert.match(declarations, /ReflectionPreparation/)
+  assert.match(declarations, /ReflectionCommitResult/)
 
   const command = join(installed, 'node_modules', '.bin', 'dsh-expmem')
   assert.match(execFileSync(command, ['--help'], { encoding: 'utf8' }), /import <claude\|codex\|all>/)

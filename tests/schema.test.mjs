@@ -234,6 +234,107 @@ test('stores auditable recursive reflections and rejects invalid source graphs',
   }
 })
 
+test('persists Reflection Runs across restart and commits idempotently', async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), 'dsh-expmem-reflection-run-'))
+  const archive = new FileExperienceArchive(rootDir, LIMITS)
+
+  try {
+    await archive.initialize()
+    const first = await archive.writeCandidate({
+      kind: 'experience',
+      title: 'Focused implementation',
+      content: 'Focused implementation reduced review risk.',
+      importance: 6,
+    }, { workspace: '/workspace/project' })
+    const second = await archive.writeCandidate({
+      kind: 'habit',
+      title: 'Evidence preference',
+      content: 'The user expects evidence before conclusions.',
+      importance: 5,
+    }, { workspace: '/workspace/project' })
+
+    const pending = await archive.ensureReflectionRun('/workspace/project', 10)
+    assert.equal(pending.status, 'pending')
+    assert.equal(pending.totalImportance, 11)
+    assert.equal(
+      (await archive.ensureReflectionRun('/workspace/project', 10)).id,
+      pending.id,
+    )
+
+    const prepared = await archive.prepareReflectionRun(pending.id, [
+      'Which focused evidence practice works?',
+    ], {
+      maxQuestions: 3,
+      maxSearchResults: 20,
+      recencyDecay: 0.995,
+    })
+    assert.equal(prepared.run.status, 'prepared')
+    assert.deepEqual(
+      new Set(prepared.questions[0].hits.map(hit => hit.id)),
+      new Set([first.id, second.id]),
+    )
+
+    const restarted = new FileExperienceArchive(rootDir, LIMITS)
+    const resumed = await restarted.ensureReflectionRun('/workspace/project', 10)
+    assert.equal(resumed.id, pending.id)
+    assert.equal(resumed.status, 'prepared')
+    const questionId = resumed.questions[0].id
+
+    await assert.rejects(restarted.commitReflectionRun(pending.id, [{
+      questionId,
+      title: 'Unsupported reflection',
+      content: 'This cites a record that was not retrieved.',
+      importance: 7,
+      sourceMemoryIds: ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'],
+    }], {}, 3), /not retrieved/)
+
+    const input = [{
+      questionId,
+      title: 'Focused evidence practice',
+      content: 'Focused implementation and explicit evidence improve review reliability.',
+      importance: 8,
+      sourceMemoryIds: [first.id],
+      tags: ['reflection'],
+    }]
+    const partialInsight = await restarted.writeCandidate({
+      kind: 'insight',
+      title: input[0].title,
+      content: input[0].content,
+      importance: input[0].importance,
+      tags: input[0].tags,
+      reflection: {
+        question: resumed.questions[0].text,
+        sourceMemoryIds: input[0].sourceMemoryIds,
+        runId: pending.id,
+        questionId,
+      },
+    }, { sessionId: 'reflection-session', workspace: '/workspace/project' })
+    const committed = await restarted.commitReflectionRun(
+      pending.id,
+      input,
+      { sessionId: 'reflection-session', workspace: '/workspace/project' },
+      3,
+    )
+    assert.equal(committed.run.status, 'completed')
+    assert.deepEqual(committed.run.consumedSourceMemoryIds, [first.id])
+    assert.equal(committed.insights[0].id, partialInsight.id)
+    assert.equal(committed.insights[0].reflection.runId, pending.id)
+    assert.equal(committed.insights[0].reflection.questionId, questionId)
+
+    const retry = await restarted.commitReflectionRun(pending.id, input, {}, 3)
+    assert.equal(retry.insights[0].id, committed.insights[0].id)
+    assert.equal((await restarted.reflectionPressure('/workspace/project')).totalImportance, 5)
+    const stored = JSON.parse(await readFile(
+      join(rootDir, 'reflection-runs', `${pending.id}.json`),
+      'utf8',
+    ))
+    assert.equal(stored.status, 'completed')
+    assert.deepEqual(stored.insightMemoryIds, [committed.insights[0].id])
+  } finally {
+    await rm(rootDir, { recursive: true, force: true })
+  }
+})
+
 test('requires qualifying evidence and treats review reports as opaque non-verifying links', async () => {
   const rootDir = await mkdtemp(join(tmpdir(), 'dsh-expmem-evidence-'))
   const archive = new FileExperienceArchive(rootDir, LIMITS)
