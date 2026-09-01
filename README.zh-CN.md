@@ -54,6 +54,17 @@ flowchart TB
 DSH 负责 Recall、上下文压缩和 Agent Loop。ExpMem 负责提炼后的 Archive、检索排序、
 reflection 来源和可信记忆生命周期。它不会复制 Session 事件。
 
+### Context Engineering
+
+这套设计可以放到 Context Engineering 的四类操作中理解：
+
+| 技巧 | 覆盖情况 | 实现 |
+|---|---|---|
+| **Write Context** | 已覆盖 | DSH 将消息和工具事件持久化为 Session Recall；Agent 通过 `expmem_write` 保存习惯、可复用经验和洞见，并在上下文压力达到 70% 时晋升持久知识。 |
+| **Select Context** | 已覆盖 | `session_search` 和 `session_event_search` 查找原始历史；`expmem_search` 按相关性、新近度和重要性排序长期记忆，Reflection Run 复用同一条检索链路。 |
+| **Compress Context** | 已覆盖 | DSH Compaction 将较早历史和既有检查点合并为新的 `<compacted-summary>`，原始事件仍留在 Session Log。ExpMem 在压缩前提示 Agent 保存高价值经验，错过提示后再从 Recall 补做晋升。 |
+| **Isolate Context** | 框架层已覆盖 | DSH 为子 Agent 建立独立 Session；fork 只复制父级已完成历史的快照，随后独立积累上下文。ExpMem 按 workspace 限定长期记忆，并将 Reflection Run 保留给主 Agent。 |
+
 ## 特色
 
 - **分层记忆：** DSH Session JSONL 保存原始历史；ExpMem 按记录保存用户习惯、任务经验和

@@ -57,6 +57,17 @@ DSH owns Recall, context compaction, and the Agent Loop. ExpMem owns the distill
 retrieval ranking, reflection provenance, and the trustworthy memory lifecycle. It does not copy
 Session events.
 
+### Context Engineering
+
+The design maps to four common Context Engineering operations:
+
+| Technique | Coverage | Implementation |
+|---|---|---|
+| **Write Context** | Covered | DSH persists messages and tool events as Session Recall. The agent stores habits, reusable experience, and insights through `expmem_write`, promoting durable knowledge at 70% context pressure. |
+| **Select Context** | Covered | `session_search` and `session_event_search` retrieve verbatim history. `expmem_search` ranks long-term memories by relevance, recency, and importance, and Reflection Runs reuse the same retrieval path. |
+| **Compress Context** | Covered | DSH Compaction merges older history and prior checkpoints into a new `<compacted-summary>` while original events remain in the Session Log. ExpMem prompts the agent to preserve high-value experience before compaction and recovers from Recall if the notice was missed. |
+| **Isolate Context** | Covered at the framework layer | DSH gives each subagent its own Session. A fork copies a snapshot of completed parent history, then accumulates context independently. ExpMem scopes long-term memory by workspace and reserves Reflection Runs for the main agent. |
+
 ## Highlights
 
 - **Tiered memory:** DSH Session JSONL holds raw history; ExpMem stores habits, experience, and
